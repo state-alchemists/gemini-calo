@@ -1,0 +1,7 @@
+from gemini_calo.proxy import GeminiProxyService
+from gemini_calo.middlewares.auth import auth_middleware
+from gemini_calo.middlewares.logging import logging_middleware
+
+assert GeminiProxyService
+assert auth_middleware
+assert logging_middleware
