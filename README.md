@@ -42,10 +42,13 @@ The server is configured through environment variables. You can create a `.env` 
 
 **Example `.env` file:**
 
-```
-GEMINI_CALO_API_KEYS=your_gemini_key_1,your_gemini_key_2
-GEMINI_CALO_PROXY_API_KEYS=my_secret_proxy_key_1,my_secret_proxy_key_2
-GEMINI_CALO_HTTP_PORT=8080
+```bash
+# Your gemini API Keys
+export GEMINI_CALO_API_KEYS=AIaYourGeminiKey1,AIaYourGeminiKey2
+# API Keys for your internal user
+export GEMINI_CALO_PROXY_API_KEYS=my_secret_proxy_key_1,my_secret_proxy_key_2
+# Gemini Calo HTTP Port
+export GEMINI_CALO_HTTP_PORT=8080
 ```
 
 ### 3. Running the Server
@@ -166,4 +169,98 @@ async def modify_request_middleware(request: Request, call_next):
 app.middleware("http")(modify_request_middleware)
 
 # ... then add the Gemini Calo proxy and routers as shown above
+```
+
+## Integration with Zrb
+
+Suppose you run Gemini Calo with the following configuration, then you will have Gemini Calo run on `http://localhost:8080`.
+
+```bash
+# Your gemini API Keys
+export GEMINI_CALO_API_KEYS=AIaYourGeminiKey1,AIaYourGeminiKey2
+# API Keys for your internal user
+export GEMINI_CALO_PROXY_API_KEYS=my_secret_proxy_key_1,my_secret_proxy_key_2
+# Gemini Calo HTTP Port
+export GEMINI_CALO_HTTP_PORT=8080
+
+# Start Gemini Calo
+gemini-calo
+```
+
+### Integration Using OpenAI Compatibility Layer
+
+To use OpenAI compatibility layer with Zrb, you need to set some environment variables.
+
+```bash
+# OpenAI compatibility URL
+export ZRB_LLM_BASE_URL=http://localhost:8080/v1beta/openai/
+# One of your valid API Key for internal user
+export ZRB_LLM_API_KEY=my_secret_proxy_key_1
+# The model you want to use
+export ZRB_LLM_MODEL=gemini-2.5-flash
+
+# Run `zrb llm ask` or `zrb llm chat`
+zrb llm ask "What is the current weather at my current location?"
+```
+
+### Integration Using Gemini Endpoint
+
+To use Gemini Endpoint, you will need to edit or create `zrb_init.py`
+
+```python
+from google import genai
+from google.genai.types import HttpOptions
+from pydantic_ai.models.gemini import GeminiModelSettings
+from pydantic_ai.providers.google import GoogleProvider
+from pydantic_ai.models.google import GoogleModel
+from zrb import llm_config
+
+client = genai.Client(
+    api_key="my_secret_proxy_key_1",  # One of your valid API Key for internal user
+    http_options=HttpOptions(
+        base_url="http://localhost:8080",
+    ),
+)
+
+provider = GoogleProvider(client=client)
+
+model = GoogleModel(
+    model_name="gemini-2.5-flash",
+    provider=provider,
+    settings=GeminiModelSettings(
+        temperature=0.0,
+        gemini_safety_settings=[
+            # Let's become evil 😈😈😈
+            # https://ai.google.dev/gemini-api/docs/safety-settings
+            {
+                "category": "HARM_CATEGORY_HARASSMENT",
+                "threshold": "BLOCK_NONE",
+            },
+            {
+                "category": "HARM_CATEGORY_HATE_SPEECH",
+                "threshold": "BLOCK_NONE",
+            },
+            {
+                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "threshold": "BLOCK_NONE",
+            },
+            {
+                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "threshold": "BLOCK_NONE",
+            },
+            {
+                "category": "HARM_CATEGORY_CIVIC_INTEGRITY",
+                "threshold": "BLOCK_NONE",
+            },
+        ]
+    )
+)
+llm_config.set_default_model(model)
+```
+
+Once you set up everything, you can start interacting with Zrb.
+
+```bash
+# Run `zrb llm ask` or `zrb llm chat`
+zrb llm ask "What is the current weather at my current location?"
 ```
