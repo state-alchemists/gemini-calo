@@ -136,13 +136,13 @@ def test_gemini_stream_generate_content(client, httpx_mock):
 def test_openai_chat_completions(client, httpx_mock):
     mock_response_content = json.dumps({"choices": [{"message": {"content": "Hello"}}]})
     httpx_mock.add_response(
-        url=f"{BASE_URL}/v1/chat/completions",
+        url=f"{BASE_URL}/v1beta/openai/chat/completions",
         content=mock_response_content,
         status_code=200,
     )
 
     response = client.post(
-        "/v1/chat/completions",
+        "/v1beta/openai/chat/completions",
         json={
             "model": "gemini-1.5-flash",
             "messages": [{"role": "user", "content": "Hello"}],
@@ -176,13 +176,13 @@ def test_openai_function_calling(client, httpx_mock):
         }
     )
     httpx_mock.add_response(
-        url=f"{BASE_URL}/v1/chat/completions",
+        url=f"{BASE_URL}/v1beta/openai/chat/completions",
         content=mock_response_content,
         status_code=200,
     )
 
     response = client.post(
-        "/v1/chat/completions",
+        "/v1beta/openai/chat/completions",
         json={
             "model": "gemini-1.5-flash",
             "messages": [{"role": "user", "content": "What is the weather in Boston?"}],
@@ -205,13 +205,13 @@ def test_openai_chat_completions_streaming(client, httpx_mock):
     )
 
     httpx_mock.add_response(
-        url=f"{BASE_URL}/v1/chat/completions",
+        url=f"{BASE_URL}/v1beta/openai/chat/completions",
         content=mock_response_content,
         status_code=200,
     )
 
     response = client.post(
-        "/v1/chat/completions",
+        "/v1beta/openai/chat/completions",
         json={
             "model": "gemini-1.5-flash",
             "messages": [{"role": "user", "content": "Hello"}],

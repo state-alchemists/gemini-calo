@@ -32,14 +32,14 @@ class GeminiProxyService:
 
     def _add_routes(self):
         self.openai_router.add_api_route(
-            "/v1/chat/completions",
+            "/v1beta/openai/chat/completions",
             self.forward_openai_request,
             methods=["POST"],
             response_model=Any,
             # response_class=Response,
         )
         self.openai_router.add_api_route(
-            "/v1/embeddings",
+            "/v1beta/openai/embeddings",
             self.forward_openai_request,
             methods=["POST"],
             response_model=Any,
@@ -69,9 +69,9 @@ class GeminiProxyService:
 
     @classmethod
     def get_request_type(cls, request: Request) -> str:
-        if request.url.path == "/v1/chat/completions":
+        if request.url.path == "/v1beta/openai/chat/completions":
             return REQUEST_TYPE.OPENAI_COMPLETION
-        if request.url.path == "/v1/embeddings":
+        if request.url.path == "/v1beta/openai/embeddings":
             return REQUEST_TYPE.OPENAI_EMBEDDING
         if request.url.path.startswith("/v1beta/models/"):
             if request.url.path.endswith(":generateContent"):
@@ -95,11 +95,7 @@ class GeminiProxyService:
         """Forward openai request"""
         api_key = self.get_gemini_api_key()
         client = self.get_httpx_client()
-        url = httpx.URL(
-            scheme="https",
-            path=request.url.path,
-            query=request.url.query.encode("utf-8"),
-        )
+        url = httpx.URL(path=request.url.path, query=request.url.query.encode("utf-8"))
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
