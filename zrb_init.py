@@ -3,9 +3,7 @@ import os
 from zrb import CmdTask, Group, cli
 
 get_cwd = lambda ctx: os.path.dirname(__file__)
-
 calo_group = cli.add_group(Group("calo", description="Calo Management"))
-
 
 create_venv = CmdTask(
     name="create-calo-venv",
