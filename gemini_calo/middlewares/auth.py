@@ -1,14 +1,30 @@
 import inspect
+from functools import partial
 from typing import Any, Callable, Coroutine
+
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
-from gemini_calo.proxy import GeminiProxyService, REQUEST_TYPE
+
+from gemini_calo.proxy import REQUEST_TYPE, GeminiProxyService
+
+
+def create_auth_middleware(
+    user_api_key_checker: (
+        str | list[str] | Callable[[str], bool | Coroutine[Any, Any, bool]] | None
+    ) = None,
+) -> Callable[
+    [Request, Callable[[Request], Coroutine[Any, Any, Response]]],
+    Coroutine[Any, Any, Response],
+]:
+    return partial(auth_middleware, user_api_key_checker=user_api_key_checker)
 
 
 async def auth_middleware(
     request: Request,
     call_next: Callable[[Request], Coroutine[Any, Any, Response]],
-    user_api_key_checker: str | list[str] | Callable[[str], bool | Coroutine[Any, Any, bool]] | None = None
+    user_api_key_checker: (
+        str | list[str] | Callable[[str], bool | Coroutine[Any, Any, bool]] | None
+    ) = None,
 ) -> Response:
     # If no checker is set, skip this
     if user_api_key_checker is None:
@@ -54,8 +70,10 @@ def _get_request_api_key(request: Request) -> str | None:
 
 
 async def _check_is_authorized(
-    user_api_key_checker: str | list[str] | Callable[[str], bool | Coroutine[Any, Any, bool]] | None,
-    api_key: str
+    user_api_key_checker: (
+        str | list[str] | Callable[[str], bool | Coroutine[Any, Any, bool]] | None
+    ),
+    api_key: str,
 ) -> bool:
     if inspect.iscoroutinefunction(user_api_key_checker):
         return await user_api_key_checker(api_key)

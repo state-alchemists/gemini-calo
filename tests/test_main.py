@@ -1,10 +1,12 @@
+import json
+from functools import partial
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from gemini_calo.proxy import GeminiProxyService
+
 from gemini_calo.middlewares.auth import auth_middleware
-from functools import partial
-import json
+from gemini_calo.proxy import GeminiProxyService
 
 BASE_URL = "https://generativelanguage.googleapis.com"
 VALID_API_KEY = "test-proxy-key"
@@ -62,7 +64,7 @@ def test_gemini_generate_content_with_invalid_auth(client):
 def test_gemini_generate_content_without_auth(client):
     response = client.post(
         "/v1beta/models/gemini-1.5-flash:generateContent",
-        json={"contents": [{"parts": [{"text": "Hello"}]}]}
+        json={"contents": [{"parts": [{"text": "Hello"}]}]},
     )
     assert response.status_code == 401
 
@@ -132,9 +134,7 @@ def test_gemini_stream_generate_content(client, httpx_mock):
 
 
 def test_openai_chat_completions(client, httpx_mock):
-    mock_response_content = json.dumps(
-        {"choices": [{"message": {"content": "Hello"}}]}
-    )
+    mock_response_content = json.dumps({"choices": [{"message": {"content": "Hello"}}]})
     httpx_mock.add_response(
         url=f"{BASE_URL}/v1/chat/completions",
         content=mock_response_content,

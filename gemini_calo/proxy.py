@@ -1,9 +1,11 @@
-from typing import Any
-from fastapi import Request, Response, APIRouter
-from fastapi.responses import StreamingResponse
-from gemini_calo.logger import logger
 from enum import Enum
+from typing import Any
+
 import httpx
+from fastapi import APIRouter, Request, Response
+from fastapi.responses import StreamingResponse
+
+from gemini_calo.logger import logger
 
 
 class REQUEST_TYPE(Enum):
