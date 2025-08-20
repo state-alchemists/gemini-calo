@@ -19,8 +19,8 @@ pytest = "~8.3.5"
 httpx = "~0.28.1"
 pytest-httpx = "~0.35.0"
 
-# [tool.pytest.ini_options]
-# asyncio_default_fixture_loop_scope = "function"
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.poetry.scripts]
 gemini-calo = "gemini_calo.__main__:start_server"

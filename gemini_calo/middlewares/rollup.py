@@ -8,13 +8,16 @@ from typing import Any, Callable, Coroutine, cast
 from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
 
+from gemini_calo.config import CONVERSATION_SUMMARIZATION_LRU_SIZE
 from gemini_calo.proxy import REQUEST_TYPE, GeminiProxyService
 
 DEFAULT_SUMMARIZER_PROMPT = "Summarize the following conversation..."
 
+_lru_cache = LRUCache(maxsize=CONVERSATION_SUMMARIZATION_LRU_SIZE)
+
 
 def create_rollup_middleware(
-    lru_size: int = 128,
+    lru_cache: LRUCache = _lru_cache,
     conversation_size_threshold: int = 4096,
     summarizer_prompt: str = DEFAULT_SUMMARIZER_PROMPT,
     gemini_api_key: str | None = None,
@@ -25,10 +28,9 @@ def create_rollup_middleware(
     """
     Creates a middleware to handle conversation roll-ups.
     """
-    cache = LRUCache(maxsize=lru_size)
     return partial(
         rollup_middleware,
-        cache=cache,
+        cache=lru_cache,
         conversation_size_threshold=conversation_size_threshold,
         summarizer_prompt=summarizer_prompt,
         gemini_api_key=gemini_api_key,
@@ -76,7 +78,7 @@ def _inject_gemini_system_prompt(body: dict, context: str) -> dict:
     return body
 
 
-def _summarize_conversation(
+async def _summarize_conversation(
     conversation: str, summarizer_prompt: str, api_key: str
 ) -> str:
     """Calls Gemini API to summarize the conversation."""

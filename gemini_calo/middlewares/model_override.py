@@ -1,89 +1,109 @@
-import json
 import inspect
-from functools import partial
-from typing import Any, Callable, Coroutine
+import json
+from typing import Any, Callable, Coroutine, Union
 
 from fastapi import Request, Response
 
+from gemini_calo import config
 from gemini_calo.proxy import REQUEST_TYPE, GeminiProxyService
 
+# Define type hints for clarity
+ModelTransformerCallable = Callable[[str], Union[str, Coroutine[Any, Any, str]]]
+ModelTransformerArg = Union[ModelTransformerCallable, str, None]
 
-def create_model_override_middleware(
-    model_transformer: Callable[[str], str | Coroutine[Any, Any, str]] | None = None,
-) -> Callable[
-    [Request, Callable[[Request], Coroutine[Any, Any, Response]]],
-    Coroutine[Any, Any, Response],
-]:
+
+async def _resolve_new_model_name(
+    transformer: ModelTransformerArg, original_model: str
+) -> str:
     """
-    Creates a middleware to override model names in requests using a transformer function.
+    Resolves the new model name from a transformer argument, which can be a
+    callable, a coroutine, a string, or None.
     """
-    return partial(model_override_middleware, model_transformer=model_transformer)
+    if callable(transformer):
+        if inspect.iscoroutinefunction(transformer):
+            return await transformer(original_model)
+        return transformer(original_model)
+    if isinstance(transformer, str):
+        return transformer
+    return original_model
+
+
+async def _transform_model_in_openai_request(
+    request: Request, transformer: ModelTransformerArg
+) -> Request:
+    """Transforms the model in an OpenAI completion request."""
+    body = await request.body()
+    try:
+        json_body = json.loads(body)
+        original_model = json_body.get("model")
+        if not original_model:
+            return request
+
+        new_model = await _resolve_new_model_name(transformer, original_model)
+
+        if new_model and new_model != original_model:
+            json_body["model"] = new_model
+            new_body = json.dumps(json_body).encode()
+
+            async def receive():
+                return {"type": "http.request", "body": new_body}
+
+            return Request(request.scope, receive)
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return request
+
+
+async def _transform_model_in_gemini_request(
+    request: Request, transformer: ModelTransformerArg
+) -> Request:
+    """Transforms the model in a Gemini completion request."""
+    path = request.scope.get("path", "")
+    try:
+        parts = path.split("/")
+        model_part = parts[3]
+        action_part = model_part.split(":")[-1]
+        original_model = model_part.removesuffix(f":{action_part}")
+
+        if not original_model:
+            return request
+
+        new_model = await _resolve_new_model_name(transformer, original_model)
+
+        if new_model and new_model != original_model:
+            new_path = path.replace(original_model, new_model, 1)
+            request.scope["path"] = new_path
+    except IndexError:
+        pass
+    return request
 
 
 async def model_override_middleware(
     request: Request,
     call_next: Callable[[Request], Coroutine[Any, Any, Response]],
-    model_transformer: Callable[[str], str | Coroutine[Any, Any, str]] | None = None,
+    model_transformer: ModelTransformerArg = None,
 ) -> Response:
     """
-    Overrides the model in the request if a transformer function is provided.
-    Handles both OpenAI (body) and Gemini (URL path) style requests.
+    Core middleware logic that resolves the transformer on each request and
+    applies the model transformation.
     """
-    if not callable(model_transformer):
+    # Determine the transformer to use, falling back to the environment variable
+    transformer = model_transformer
+    if transformer is None and config.MODEL_OVERRIDE:
+        transformer = config.MODEL_OVERRIDE
+
+    # If no transformer is defined, proceed without modification
+    if transformer is None:
         return await call_next(request)
 
     request_type = GeminiProxyService.get_request_type(request)
 
-    # Handle OpenAI completion requests by modifying the request body
     if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
-        body = await request.body()
-        try:
-            json_body = json.loads(body)
-            original_model = json_body.get("model")
-            if original_model:
-                if inspect.iscoroutinefunction(model_transformer):
-                    new_model = await model_transformer(original_model)
-                else:
-                    new_model = model_transformer(original_model)
-
-                if new_model != original_model:
-                    json_body["model"] = new_model
-                    # Re-serialize the body and create a new request
-                    new_body = json.dumps(json_body).encode()
-
-                    async def receive():
-                        return {"type": "http.request", "body": new_body}
-
-                    request = Request(request.scope, receive)
-        except (json.JSONDecodeError, AttributeError):
-            # If body is not valid JSON or not present, proceed without modification
-            pass
-
-    # Handle Gemini completion requests by modifying the URL path
+        request = await _transform_model_in_openai_request(request, transformer)
     elif request_type in [
         REQUEST_TYPE.GEMINI_COMPLETION,
         REQUEST_TYPE.GEMINI_STREAMING_COMPLETION,
     ]:
-        # Extract model from path, e.g., /v1beta/models/gemini-pro:generateContent
-        path = request.scope.get("path", "")
-        try:
-            # The model is between the 3rd and last part of the path
-            parts = path.split("/")
-            model_part = parts[3]
-            action_part = model_part.split(":")[-1]
-            original_model = model_part.removesuffix(f":{action_part}")
-
-            if original_model:
-                if inspect.iscoroutinefunction(model_transformer):
-                    new_model = await model_transformer(original_model)
-                else:
-                    new_model = model_transformer(original_model)
-
-                if new_model != original_model:
-                    new_path = path.replace(original_model, new_model, 1)
-                    request.scope["path"] = new_path
-        except IndexError:
-            # If path structure is unexpected, proceed without modification
-            pass
+        request = await _transform_model_in_gemini_request(request, transformer)
 
     return await call_next(request)

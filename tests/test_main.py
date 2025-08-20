@@ -108,12 +108,7 @@ def test_gemini_function_calling(client, httpx_mock):
 
 
 def test_gemini_stream_generate_content(client, httpx_mock):
-    mock_response_content = b"".join(
-        [
-            b'{"candidates": [{"content": {"parts": [{"text": "Hello"}]}}]}',
-            b'{"candidates": [{"content": {"parts": [{"text": " world"}]}}]}',
-        ]
-    )
+    mock_response_content = b"{\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Hello\"}]}}]}\n{\"candidates\": [{\"content\": {\"parts\": [{\"text\": \" world\"}]}}]}"
 
     httpx_mock.add_response(
         url=f"{BASE_URL}/v1beta/models/gemini-1.5-flash:streamGenerateContent",
@@ -166,7 +161,7 @@ def test_openai_function_calling(client, httpx_mock):
                                 "type": "function",
                                 "function": {
                                     "name": "find_weather",
-                                    "arguments": '{\n  "location": "Boston"\n}',
+                                    "arguments": '{\n  "location": "Boston"\n}'
                                 },
                             }
                         ]
@@ -196,13 +191,7 @@ def test_openai_function_calling(client, httpx_mock):
 
 
 def test_openai_chat_completions_streaming(client, httpx_mock):
-    mock_response_content = b"".join(
-        [
-            b'data: {"choices": [{"delta": {"content": "Hello"}}]}\n\n',
-            b'data: {"choices": [{"delta": {"content": " world"}}]}\n\n',
-            b"data: [DONE]\n\n",
-        ]
-    )
+    mock_response_content = b"data: {\"choices\": [{\"delta\": {\"content\": \"Hello\"}}]}\n\ndata: {\"choices\": [{\"delta\": {\"content\": \" world\"}}]}\n\ndata: [DONE]\n\n"
 
     httpx_mock.add_response(
         url=f"{BASE_URL}/v1beta/openai/chat/completions",
@@ -224,3 +213,23 @@ def test_openai_chat_completions_streaming(client, httpx_mock):
     streaming_content = response.iter_bytes()
     chunks = [chunk for chunk in streaming_content]
     assert b"".join(chunks) == mock_response_content
+
+def test_openai_to_gemini_conversion(client, httpx_mock):
+    mock_response_content = json.dumps({"candidates": [{"finishReason": "STOP"}]})
+    httpx_mock.add_response(
+        url=f"{BASE_URL}/v1beta/openai/chat/completions",
+        content=mock_response_content,
+        status_code=200,
+    )
+
+    response = client.post(
+        "/v1beta/openai/chat/completions",
+        json={
+            "model": "gemini-pro",
+            "messages": [{"role": "user", "content": "Hello"}],
+        },
+        headers={"Authorization": f"Bearer {VALID_API_KEY}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == json.loads(mock_response_content)
