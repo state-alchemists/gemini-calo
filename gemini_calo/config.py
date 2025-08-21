@@ -31,3 +31,13 @@ LOG_LEVEL = _LOG_LEVEL_MAP.get(
 LOG_FILE = os.getenv("GEMINI_CALO_LOG_FILE", "app.log")
 CONVERSATION_SUMMARIZATION_LRU_SIZE = os.getenv("GEMINI_CALO_CONVERSATION_SUMMARIZATION_LRU_CACHE", 20)
 MODEL_OVERRIDE = os.getenv("GEMINI_CALO_MODEL_OVERRIDE", "")
+DEFAULT_SUMMARIZER_PROMPT = os.getenv(
+    "GEMINI_CALO_DEFAULT_SUMMARIZER_PROMPT",
+    """You are a summarization expert. Your task is to summarize the following conversation.
+The summary must include the following two parts:
+1.  **Context**: A brief summary of the conversation's context.
+2.  **Transcript**: The verbatim conversation transcript.
+
+Here is the conversation:"""
+)
+

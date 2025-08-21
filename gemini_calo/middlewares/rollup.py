@@ -8,10 +8,11 @@ from typing import Any, Callable, Coroutine, cast
 from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
 
-from gemini_calo.config import CONVERSATION_SUMMARIZATION_LRU_SIZE
+from gemini_calo.config import (
+    CONVERSATION_SUMMARIZATION_LRU_SIZE,
+    DEFAULT_SUMMARIZER_PROMPT,
+)
 from gemini_calo.proxy import REQUEST_TYPE, GeminiProxyService
-
-DEFAULT_SUMMARIZER_PROMPT = "Summarize the following conversation..."
 
 _lru_cache = LRUCache(maxsize=CONVERSATION_SUMMARIZATION_LRU_SIZE)
 
@@ -19,7 +20,6 @@ _lru_cache = LRUCache(maxsize=CONVERSATION_SUMMARIZATION_LRU_SIZE)
 def create_rollup_middleware(
     lru_cache: LRUCache = _lru_cache,
     conversation_size_threshold: int = 4096,
-    summarizer_prompt: str = DEFAULT_SUMMARIZER_PROMPT,
     gemini_api_key: str | None = None,
 ) -> Callable[
     [Request, Callable[[Request], Coroutine[Any, Any, Response]]],
@@ -32,7 +32,6 @@ def create_rollup_middleware(
         rollup_middleware,
         cache=lru_cache,
         conversation_size_threshold=conversation_size_threshold,
-        summarizer_prompt=summarizer_prompt,
         gemini_api_key=gemini_api_key,
     )
 
@@ -57,7 +56,7 @@ def _inject_openai_system_prompt(body: dict, context: str) -> dict:
     messages = body.get("messages", [])
     for message in messages:
         if message.get("role") == "system":
-            message["content"] = f"{context}\n{message.get('content', '')}"
+            message["content"] = f"{context}\\n{message.get('content', '')}"
             return body
     messages.insert(0, {"role": "system", "content": context})
     body["messages"] = messages
@@ -69,24 +68,25 @@ def _inject_gemini_system_prompt(body: dict, context: str) -> dict:
         existing_instruction = body["system_instruction"]
         if isinstance(existing_instruction, dict):
             existing_text = existing_instruction.get("parts", [{}])[0].get("text", "")
-            new_text = f"{context}\n{existing_text}"
+            new_text = f"{context}\\n{existing_text}"
             existing_instruction["parts"][0]["text"] = new_text
         else:
-            body["system_instruction"] = f"{context}\n{existing_instruction}"
+            body["system_instruction"] = f"{context}\\n{existing_instruction}"
     else:
         body["system_instruction"] = {"parts": [{"text": context}]}
     return body
 
 
 async def _summarize_conversation(
-    conversation: str, summarizer_prompt: str, api_key: str
+    conversation: str,
+    api_key: str,
 ) -> str:
     """Calls Gemini API to summarize the conversation."""
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     payload = {
         "contents": [
-            {"role": "user", "parts": [{"text": f"{summarizer_prompt}\n\n{conversation}"}]}
+            {"role": "user", "parts": [{"text": f"{DEFAULT_SUMMARIZER_PROMPT}\\n\\n{conversation}"}]}
         ]
     }
     async with httpx.AsyncClient() as client:
@@ -94,7 +94,8 @@ async def _summarize_conversation(
             response = await client.post(url, json=payload, headers=headers, timeout=60)
             response.raise_for_status()
             data = response.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+            summary = data["candidates"][0]["content"]["parts"][0]["text"]
+            return f"{summary}\\n\\nVerbatim Transcript:\\n{conversation}"
         except (httpx.HTTPStatusError, KeyError, IndexError) as e:
             # In case of summarization failure, return the original conversation
             return f"Summarization failed: {e}. Original conversation: {conversation}"
@@ -105,7 +106,6 @@ async def rollup_middleware(
     call_next: Callable[[Request], Coroutine[Any, Any, Response]],
     cache: LRUCache,
     conversation_size_threshold: int,
-    summarizer_prompt: str,
     gemini_api_key: str | None,
 ) -> Response:
     request_type = GeminiProxyService.get_request_type(request)
@@ -147,13 +147,13 @@ async def rollup_middleware(
     if found_key:
         context = cast(str, cache[found_key])
         if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
-            json_body = _inject_openai_system_prompt(json_body, context)
+            json_body = _inject_openai_system_prompt(json.loads(json.dumps(json_body)), context)
             original_messages = json_body.get("messages", [])
             system_messages = [m for m in original_messages if m.get("role") == "system"]
             user_messages = [m for m in original_messages if m.get("role") != "system"]
             json_body["messages"] = system_messages + user_messages[num_matched_messages:]
         else:
-            json_body = _inject_gemini_system_prompt(json_body, context)
+            json_body = _inject_gemini_system_prompt(json.loads(json.dumps(json_body)), context)
             json_body["contents"] = messages[num_matched_messages:]
 
         new_body = json.dumps(json_body).encode()
@@ -168,15 +168,15 @@ async def rollup_middleware(
     # Response handling
     response_body = b""
     if isinstance(response, StreamingResponse):
-        async def stream_and_capture():
-            nonlocal response_body
-            async for chunk in response.body_iterator:
-                response_body += chunk
-                yield chunk
-        return StreamingResponse(stream_and_capture(), status_code=response.status_code, headers=response.headers)
-    
-    if hasattr(response, "body"):
+        # Read the entire streaming response into response_body
+        async for chunk in response.body_iterator:
+            response_body += chunk
+        # Create a new StreamingResponse from the captured body for the client
+        return_response = StreamingResponse(iter([response_body]), status_code=response.status_code, headers=response.headers)
+    elif hasattr(response, "body"):
         response_body = response.body
+    else:
+        return response # No body to process, return original response
 
     try:
         response_json = json.loads(response_body)
@@ -197,9 +197,9 @@ async def rollup_middleware(
         
         conversation_text = json.dumps(new_history)
         if len(conversation_text) > conversation_size_threshold and gemini_api_key:
-            summary = await _summarize_conversation(conversation_text, summarizer_prompt, gemini_api_key)
+            summary = await _summarize_conversation(conversation_text, gemini_api_key)
             cache[new_key] = summary
         else:
             cache[new_key] = conversation_text
 
-    return response
+    return return_response if 'return_response' in locals() else response

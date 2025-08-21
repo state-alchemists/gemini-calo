@@ -3,4 +3,4 @@ __pycache__
 .pytest_cache
 .env
 dist
-app.log
+app.log.coverage

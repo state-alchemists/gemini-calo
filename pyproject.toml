@@ -18,6 +18,7 @@ uvicorn = "^0.35.0"
 pytest = "~8.3.5"
 httpx = "~0.28.1"
 pytest-httpx = "~0.35.0"
+pytest-cov = "~5.0.0"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
