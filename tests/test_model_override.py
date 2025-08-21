@@ -5,7 +5,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from gemini_calo.middlewares.model_override import model_override_middleware
+from gemini_calo.middlewares.model_override import create_model_override_middleware
 from gemini_calo.proxy import GeminiProxyService
 
 BASE_URL = "https://generativelanguage.googleapis.com"
@@ -22,10 +22,9 @@ def client(request):
     proxy = GeminiProxyService(gemini_api_keys=["dummy-gemini-key"])
 
     if model_transformer:
-        middleware = partial(
-            model_override_middleware, model_transformer=model_transformer
+        app.middleware("http")(
+            create_model_override_middleware(model_transformer=model_transformer)
         )
-        app.middleware("http")(middleware)
 
     app.include_router(proxy.gemini_router)
     app.include_router(proxy.openai_router)
@@ -105,8 +104,7 @@ def test_env_var_override(monkeypatch, httpx_mock):
 
     client = TestClient(FastAPI())
     proxy = GeminiProxyService(gemini_api_keys=["dummy-gemini-key"])
-    middleware = partial(model_override_middleware, model_transformer=None)
-    client.app.middleware("http")(middleware)
+    client.app.middleware("http")(create_model_override_middleware())
     client.app.include_router(proxy.gemini_router)
     client.app.include_router(proxy.openai_router)
 
