@@ -37,9 +37,9 @@ def create_rollup_middleware(
 
 
 async def rollup_middleware(
-    gemini_proxy: GeminiProxyService,
     request: Request,
     call_next: Callable[[Request], Coroutine[Any, Any, Response]],
+    gemini_proxy: GeminiProxyService,
     cache: LRUCache,
     conversation_size_threshold: int,
 ) -> Response:
@@ -80,6 +80,8 @@ async def rollup_middleware(
 
     original_request = request
     if found_key:
+        print(f"found_key: {found_key}")
+        print(f"num_matched_messages: {num_matched_messages}")
         context = cast(str, cache[found_key])
         if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
             json_body = _inject_openai_system_prompt(json.loads(json.dumps(json_body)), context)
@@ -92,6 +94,7 @@ async def rollup_middleware(
             json_body["contents"] = messages[num_matched_messages:]
 
         new_body = json.dumps(json_body).encode()
+        request.state.modified_body = new_body # Store modified body in request.state
 
         async def receive():
             return {"type": "http.request", "body": new_body}
@@ -102,16 +105,16 @@ async def rollup_middleware(
 
     # Response handling
     response_body = b""
-    if isinstance(response, StreamingResponse):
+    if hasattr(response, 'body_iterator'): # Check if it's a streaming response
         # Read the entire streaming response into response_body
         async for chunk in response.body_iterator:
             response_body += chunk
         # Create a new StreamingResponse from the captured body for the client
         return_response = StreamingResponse(iter([response_body]), status_code=response.status_code, headers=response.headers)
-    elif hasattr(response, "body"):
-        response_body = response.body
     else:
-        return response # No body to process, return original response
+        response_body = response.body # For regular responses, use .body
+        # Create a new response from the captured body for the client
+        return_response = Response(content=response_body, status_code=response.status_code, headers=response.headers)
 
     try:
         response_json = json.loads(response_body)
