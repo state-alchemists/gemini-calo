@@ -18,9 +18,9 @@ _lru_cache = LRUCache(maxsize=CONVERSATION_SUMMARIZATION_LRU_SIZE)
 
 
 def create_rollup_middleware(
+    gemini_proxy: GeminiProxyService,
     lru_cache: LRUCache = _lru_cache,
     conversation_size_threshold: int = 4096,
-    gemini_api_key: str | None = None,
 ) -> Callable[
     [Request, Callable[[Request], Coroutine[Any, Any, Response]]],
     Coroutine[Any, Any, Response],
@@ -32,81 +32,16 @@ def create_rollup_middleware(
         rollup_middleware,
         cache=lru_cache,
         conversation_size_threshold=conversation_size_threshold,
-        gemini_api_key=gemini_api_key,
+        gemini_proxy=gemini_proxy,
     )
 
 
-def _extract_openai_messages(body: dict) -> list[dict]:
-    messages = body.get("messages", [])
-    return [m for m in messages if m.get("role") != "system"]
-
-
-def _extract_gemini_messages(body: dict) -> list[dict]:
-    return body.get("contents", [])
-
-
-def _get_message_key(messages: list[dict]) -> str:
-    if not messages:
-        return ""
-    message_str = json.dumps(messages, sort_keys=True)
-    return hashlib.md5(message_str.encode()).hexdigest()
-
-
-def _inject_openai_system_prompt(body: dict, context: str) -> dict:
-    messages = body.get("messages", [])
-    for message in messages:
-        if message.get("role") == "system":
-            message["content"] = f"{context}\\n{message.get('content', '')}"
-            return body
-    messages.insert(0, {"role": "system", "content": context})
-    body["messages"] = messages
-    return body
-
-
-def _inject_gemini_system_prompt(body: dict, context: str) -> dict:
-    if "system_instruction" in body:
-        existing_instruction = body["system_instruction"]
-        if isinstance(existing_instruction, dict):
-            existing_text = existing_instruction.get("parts", [{}])[0].get("text", "")
-            new_text = f"{context}\\n{existing_text}"
-            existing_instruction["parts"][0]["text"] = new_text
-        else:
-            body["system_instruction"] = f"{context}\\n{existing_instruction}"
-    else:
-        body["system_instruction"] = {"parts": [{"text": context}]}
-    return body
-
-
-async def _summarize_conversation(
-    conversation: str,
-    api_key: str,
-) -> str:
-    """Calls Gemini API to summarize the conversation."""
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
-    payload = {
-        "contents": [
-            {"role": "user", "parts": [{"text": f"{DEFAULT_SUMMARIZER_PROMPT}\\n\\n{conversation}"}]}
-        ]
-    }
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(url, json=payload, headers=headers, timeout=60)
-            response.raise_for_status()
-            data = response.json()
-            summary = data["candidates"][0]["content"]["parts"][0]["text"]
-            return f"{summary}\\n\\nVerbatim Transcript:\\n{conversation}"
-        except (httpx.HTTPStatusError, KeyError, IndexError) as e:
-            # In case of summarization failure, return the original conversation
-            return f"Summarization failed: {e}. Original conversation: {conversation}"
-
-
 async def rollup_middleware(
+    gemini_proxy: GeminiProxyService,
     request: Request,
     call_next: Callable[[Request], Coroutine[Any, Any, Response]],
     cache: LRUCache,
     conversation_size_threshold: int,
-    gemini_api_key: str | None,
 ) -> Response:
     request_type = GeminiProxyService.get_request_type(request)
     is_completion = request_type in [
@@ -196,10 +131,78 @@ async def rollup_middleware(
         new_key = _get_message_key(new_history)
         
         conversation_text = json.dumps(new_history)
-        if len(conversation_text) > conversation_size_threshold and gemini_api_key:
-            summary = await _summarize_conversation(conversation_text, gemini_api_key)
+        if len(conversation_text) > conversation_size_threshold:
+            summary = await _summarize_conversation(
+                conversation_text, gemini_proxy.get_gemini_api_key()
+            )
             cache[new_key] = summary
         else:
             cache[new_key] = conversation_text
 
     return return_response if 'return_response' in locals() else response
+
+
+def _extract_openai_messages(body: dict) -> list[dict]:
+    messages = body.get("messages", [])
+    return [m for m in messages if m.get("role") != "system"]
+
+
+def _extract_gemini_messages(body: dict) -> list[dict]:
+    return body.get("contents", [])
+
+
+def _get_message_key(messages: list[dict]) -> str:
+    if not messages:
+        return ""
+    message_str = json.dumps(messages, sort_keys=True)
+    return hashlib.md5(message_str.encode()).hexdigest()
+
+
+def _inject_openai_system_prompt(body: dict, context: str) -> dict:
+    messages = body.get("messages", [])
+    for message in messages:
+        if message.get("role") == "system":
+            message["content"] = f"{context}\\n{message.get('content', '')}"
+            return body
+    messages.insert(0, {"role": "system", "content": context})
+    body["messages"] = messages
+    return body
+
+
+def _inject_gemini_system_prompt(body: dict, context: str) -> dict:
+    if "system_instruction" in body:
+        existing_instruction = body["system_instruction"]
+        if isinstance(existing_instruction, dict):
+            existing_text = existing_instruction.get("parts", [{}])[0].get("text", "")
+            new_text = f"{context}\\n{existing_text}"
+            existing_instruction["parts"][0]["text"] = new_text
+        else:
+            body["system_instruction"] = f"{context}\\n{existing_instruction}"
+    else:
+        body["system_instruction"] = {"parts": [{"text": context}]}
+    return body
+
+
+async def _summarize_conversation(
+    conversation: str,
+    api_key: str,
+) -> str:
+    """Calls Gemini API to summarize the conversation."""
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    payload = {
+        "contents": [
+            {"role": "user", "parts": [{"text": f"{DEFAULT_SUMMARIZER_PROMPT}\\n\\n{conversation}"}]}
+        ]
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url, json=payload, headers=headers, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+            summary = data["candidates"][0]["content"]["parts"][0]["text"]
+            return f"{summary}\\n\\nVerbatim Transcript:\\n{conversation}"
+        except (httpx.HTTPStatusError, KeyError, IndexError) as e:
+            # In case of summarization failure, return the original conversation
+            return f"Summarization failed: {e}. Original conversation: {conversation}"
+
