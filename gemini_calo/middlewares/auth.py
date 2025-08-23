@@ -27,7 +27,7 @@ async def auth_middleware(
     ) = None,
 ) -> Response:
     # If no checker is set, skip this
-    if user_api_key_checker is None:
+    if user_api_key_checker is None or (isinstance(user_api_key_checker, list) and len(user_api_key_checker) == 0):
         return await call_next(request)
     # Only apply check for specifics URLs
     request_type = GeminiProxyService.get_request_type(request)

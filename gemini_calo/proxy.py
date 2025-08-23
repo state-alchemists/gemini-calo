@@ -66,6 +66,12 @@ class GeminiProxyService:
             response_model=Any,
             # response_class=Response,
         )
+        self.gemini_router.add_api_route(
+            "/v1beta/models",
+            self.forward_gemini_request,
+            methods=["GET"],
+            response_model=Any,
+        )
 
     @classmethod
     def get_request_type(cls, request: Request) -> str:
@@ -105,7 +111,7 @@ class GeminiProxyService:
             request.method,
             url,
             headers=headers,
-            content=request.stream(),
+            content=request.state.modified_body if hasattr(request.state, 'modified_body') else request.stream(),
             timeout=300.0,
         )
         response = await client.send(req, stream=True)
@@ -136,7 +142,7 @@ class GeminiProxyService:
             request.method,
             url,
             headers=headers,
-            content=request.stream(),
+            content=request.state.modified_body if hasattr(request.state, 'modified_body') else request.stream(),
             timeout=300.0,
         )
         response = await client.send(req, stream=True)
