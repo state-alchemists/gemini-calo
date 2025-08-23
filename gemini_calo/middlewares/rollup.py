@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from gemini_calo.config import (
     CONVERSATION_SUMMARIZATION_LRU_SIZE,
     DEFAULT_SUMMARIZER_PROMPT,
+    SUMMARIZATION_SIZE_THRESHOLD,
 )
 from gemini_calo.proxy import REQUEST_TYPE, GeminiProxyService
 
@@ -20,7 +21,7 @@ _lru_cache = LRUCache(maxsize=CONVERSATION_SUMMARIZATION_LRU_SIZE)
 def create_rollup_middleware(
     gemini_proxy: GeminiProxyService,
     lru_cache: LRUCache = _lru_cache,
-    conversation_size_threshold: int = 4096,
+    conversation_size_threshold: int = SUMMARIZATION_SIZE_THRESHOLD,
 ) -> Callable[
     [Request, Callable[[Request], Coroutine[Any, Any, Response]]],
     Coroutine[Any, Any, Response],
@@ -84,17 +85,19 @@ async def rollup_middleware(
         print(f"num_matched_messages: {num_matched_messages}")
         context = cast(str, cache[found_key])
         if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
-            json_body = _inject_openai_system_prompt(json.loads(json.dumps(json_body)), context)
+            json_body = _inject_openai_system_prompt(_copy_json(json_body), context)
             original_messages = json_body.get("messages", [])
             system_messages = [m for m in original_messages if m.get("role") == "system"]
-            user_messages = [m for m in original_messages if m.get("role") != "system"]
+            user_messages = [
+                m for m in original_messages if m.get("role") != "system"
+            ]
             json_body["messages"] = system_messages + user_messages[num_matched_messages:]
         else:
-            json_body = _inject_gemini_system_prompt(json.loads(json.dumps(json_body)), context)
+            json_body = _inject_gemini_system_prompt(_copy_json(json_body), context)
             json_body["contents"] = messages[num_matched_messages:]
 
         new_body = json.dumps(json_body).encode()
-        request.state.modified_body = new_body # Store modified body in request.state
+        request.state.modified_body = new_body  # Store modified body in request.state
 
         async def receive():
             return {"type": "http.request", "body": new_body}
@@ -110,11 +113,19 @@ async def rollup_middleware(
         async for chunk in response.body_iterator:
             response_body += chunk
         # Create a new StreamingResponse from the captured body for the client
-        return_response = StreamingResponse(iter([response_body]), status_code=response.status_code, headers=response.headers)
+        return_response = StreamingResponse(
+            iter([response_body]),
+            status_code=response.status_code,
+            headers=response.headers
+        )
     else:
-        response_body = response.body # For regular responses, use .body
+        response_body = response.body  # For regular responses, use .body
         # Create a new response from the captured body for the client
-        return_response = Response(content=response_body, status_code=response.status_code, headers=response.headers)
+        return_response = Response(
+            content=response_body,
+            status_code=response.status_code,
+            headers=response.headers
+        )
 
     try:
         response_json = json.loads(response_body)
@@ -165,7 +176,7 @@ def _inject_openai_system_prompt(body: dict, context: str) -> dict:
     messages = body.get("messages", [])
     for message in messages:
         if message.get("role") == "system":
-            message["content"] = f"{context}\\n{message.get('content', '')}"
+            message["content"] = f"{context}\n{message.get('content', '')}"
             return body
     messages.insert(0, {"role": "system", "content": context})
     body["messages"] = messages
@@ -176,11 +187,13 @@ def _inject_gemini_system_prompt(body: dict, context: str) -> dict:
     if "system_instruction" in body:
         existing_instruction = body["system_instruction"]
         if isinstance(existing_instruction, dict):
-            existing_text = existing_instruction.get("parts", [{}])[0].get("text", "")
-            new_text = f"{context}\\n{existing_text}"
+            existing_text = existing_instruction.get(
+                "parts", [{}]
+            )[0].get("text", "")
+            new_text = f"{context}\n{existing_text}"
             existing_instruction["parts"][0]["text"] = new_text
         else:
-            body["system_instruction"] = f"{context}\\n{existing_instruction}"
+            body["system_instruction"] = f"{context}\n{existing_instruction}"
     else:
         body["system_instruction"] = {"parts": [{"text": context}]}
     return body
@@ -191,21 +204,31 @@ async def _summarize_conversation(
     api_key: str,
 ) -> str:
     """Calls Gemini API to summarize the conversation."""
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"  # noqa
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     payload = {
         "contents": [
-            {"role": "user", "parts": [{"text": f"{DEFAULT_SUMMARIZER_PROMPT}\\n\\n{conversation}"}]}
+            {"role": "user", "parts": [{"text": f"{DEFAULT_SUMMARIZER_PROMPT}\n\n{conversation}"}]}
         ]
     }
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(url, json=payload, headers=headers, timeout=60)
+            response = await client.post(
+                url, json=payload, headers=headers, timeout=60
+            )
             response.raise_for_status()
             data = response.json()
             summary = data["candidates"][0]["content"]["parts"][0]["text"]
-            return f"{summary}\\n\\nVerbatim Transcript:\\n{conversation}"
+            return f"{summary}\n\nVerbatim Transcript:\n{conversation}"
         except (httpx.HTTPStatusError, KeyError, IndexError) as e:
-            # In case of summarization failure, return the original conversation
+            # In case of summarization failure,
+            # return the original conversation
             return f"Summarization failed: {e}. Original conversation: {conversation}"
 
+
+def _copy_json(obj: dict) -> dict:
+    """
+    Creates a deep copy of a JSON-serializable dictionary.
+    This is a workaround to avoid issues with copy.deepcopy.
+    """
+    return json.loads(json.dumps(obj))
