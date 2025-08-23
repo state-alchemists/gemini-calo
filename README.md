@@ -36,9 +36,23 @@ pip install gemini-calo
 
 The server is configured through environment variables. You can create a `.env` file in your working directory to store them.
 
-*   `GEMINI_CALO_API_KEYS`: A comma-separated list of your Google Gemini API keys. The proxy will rotate through these keys for outgoing requests.
-*   `GEMINI_CALO_PROXY_API_KEYS`: (Optional) A comma-separated list of API keys that clients must provide to use the proxy. If not set, the proxy will be open to anyone.
-*   `GEMINI_CALO_HTTP_PORT`: (Optional) The port on which the server will run. Defaults to `8000`.
+*   `GEMINI_CALO_API_KEYS`: A comma-separated list of your Google Gemini API keys. The proxy will rotate through these keys for outgoing requests. If this is not set, the proxy will not be able to make requests to the Gemini API.
+*   `GEMINI_CALO_PROXY_API_KEYS`: (Optional) A comma-separated list of API keys that clients must provide to use the proxy. If not set, the proxy will be open to anyone, meaning no API key is required for access.
+*   `GEMINI_CALO_HTTP_PORT`: The port on which the server will run. Defaults to `8000`.
+*   `GEMINI_CALO_LOG_LEVEL`: Sets the logging level for the application. Options include `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. If not set, it defaults to `CRITICAL`.
+*   `GEMINI_CALO_LOG_FILE`: Specifies the file where logs will be written. Defaults to `app.log`.
+*   `GEMINI_CALO_CONVERSATION_SUMMARIZATION_LRU_CACHE`: Sets the size of the LRU cache for conversation summarization. Defaults to `20`.
+*   `GEMINI_CALO_MODEL_OVERRIDE`: Allows you to specify a model to override the default Gemini model.
+*   `PY_IGNORE_IMPORTMISMATCH`: (Used by `pydantic-ai`) If set, ignores import mismatches.
+*   `PYTEST_THEME`: (Used by `pytest-sugar`) Sets the theme for pytest output.
+*   `PYTEST_THEME_MODE`: (Used by `pytest-sugar`) Sets the theme mode (e.g., `dark`) for pytest output.
+*   `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CONFIG_DIRS`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`: Standard XDG base directory environment variables.
+*   `DISTUTILS_USE_SDK`: (Used by `setuptools`) If set, indicates whether to use the SDK.
+*   `SETUPTOOLS_EXT_SUFFIX`: (Used by `setuptools`) Specifies the suffix for extension modules.
+*   `PYDANTIC_PRIVATE_ALLOW_UNHANDLED_SCHEMA_TYPES`: (Used by `pydantic`) Allows unhandled schema types.
+*   `PYDANTIC_DISABLE_PLUGINS`: (Used by `pydantic`) Disables pydantic plugins.
+*   `PYDANTIC_VALIDATE_CORE_SCHEMAS`: (Used by `pydantic`) Enables validation of core schemas.
+*   `EXCEPTIONGROUP_NO_PATCH`: (Used by `exceptiongroup`) If set, prevents patching of the `ExceptionGroup` class.
 
 **Example `.env` file:**
 
@@ -49,6 +63,10 @@ export GEMINI_CALO_API_KEYS=AIaYourGeminiKey1,AIaYourGeminiKey2
 export GEMINI_CALO_PROXY_API_KEYS=my_secret_proxy_key_1,my_secret_proxy_key_2
 # Gemini Calo HTTP Port
 export GEMINI_CALO_HTTP_PORT=8080
+# Logging level
+export GEMINI_CALO_LOG_LEVEL=DEBUG
+# Log file
+export GEMINI_CALO_LOG_FILE=gemini_calo.log
 ```
 
 ### 3. Running the Server
