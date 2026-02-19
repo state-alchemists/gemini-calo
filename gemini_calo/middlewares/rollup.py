@@ -1,6 +1,5 @@
 import json
 import hashlib
-import httpx
 from cachetools import LRUCache
 from functools import partial
 from typing import Any, Callable, Coroutine, cast
@@ -14,6 +13,8 @@ from gemini_calo.config import (
     SUMMARIZATION_SIZE_THRESHOLD,
 )
 from gemini_calo.proxy import REQUEST_TYPE, GeminiProxyService
+from gemini_calo.util.request import decompress_content, create_http_client
+
 
 _lru_cache = LRUCache(maxsize=CONVERSATION_SUMMARIZATION_LRU_SIZE)
 
@@ -127,6 +128,12 @@ async def rollup_middleware(
             headers=response.headers
         )
 
+    # Add gzip detection and decompression before JSON parsing
+    # Check if response is compressed
+    content_encoding = response.headers.get('content-encoding')
+    if content_encoding:
+        response_body = decompress_content(response_body, content_encoding)
+
     try:
         response_json = json.loads(response_body)
     except json.JSONDecodeError:
@@ -211,7 +218,7 @@ async def _summarize_conversation(
             {"role": "user", "parts": [{"text": f"{DEFAULT_SUMMARIZER_PROMPT}\n\n{conversation}"}]}
         ]
     }
-    async with httpx.AsyncClient() as client:
+    async with create_http_client() as client:
         try:
             response = await client.post(
                 url, json=payload, headers=headers, timeout=60
@@ -220,7 +227,7 @@ async def _summarize_conversation(
             data = response.json()
             summary = data["candidates"][0]["content"]["parts"][0]["text"]
             return f"{summary}\n\nVerbatim Transcript:\n{conversation}"
-        except (httpx.HTTPStatusError, KeyError, IndexError) as e:
+        except Exception as e:
             # In case of summarization failure,
             # return the original conversation
             return f"Summarization failed: {e}. Original conversation: {conversation}"

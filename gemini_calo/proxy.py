@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
 
 from gemini_calo.logger import logger
+from gemini_calo.util.request import create_http_client, strip_compression_headers
 
 
 class REQUEST_TYPE(Enum):
@@ -95,7 +96,12 @@ class GeminiProxyService:
         return key
 
     def get_httpx_client(self):
-        return httpx.AsyncClient(base_url=self._base_url)
+        return create_http_client(
+            base_url=self._base_url,
+            accept_compression=True,
+            follow_redirects=False,
+            timeout=300.0,
+        )
 
     async def forward_openai_request(self, request: Request) -> Response:
         """Forward openai request"""
@@ -114,18 +120,38 @@ class GeminiProxyService:
             content=request.state.modified_body if hasattr(request.state, 'modified_body') else request.stream(),
             timeout=300.0,
         )
-        response = await client.send(req, stream=True)
-        if hasattr(response, "aiter_raw"):
+        # Get request type
+        request_type = self.get_request_type(request)
+        # Check if this is a streaming endpoint
+        is_streaming = request.url.path.endswith(":streamGenerateContent") or (
+            request_type == REQUEST_TYPE.OPENAI_COMPLETION and 
+            hasattr(request.state, 'stream') and request.state.stream
+        )
+        if is_streaming:
+            # For streaming responses, use stream=True
+            response = await client.send(req, stream=True)
+            # Get response headers
+            response_headers = dict(response.headers)
+            # For streaming responses, return the raw stream
+            # Compression will be handled by the client
             return StreamingResponse(
                 response.aiter_raw(),
                 status_code=response.status_code,
-                headers=dict(response.headers),
+                headers=strip_compression_headers(response_headers),
             )
-        response_body = await response.aread()
+        # For non-streaming responses, don't use stream=True
+        # This allows httpx to automatically handle decompression
+        response = await client.send(req, stream=False)
+        # Get response headers
+        response_headers = dict(response.headers)
+        # Read the response body (httpx should have already decompressed it)
+        response_body = response.content
+        # Strip compression headers since content is now decompressed
+        response_headers = strip_compression_headers(response_headers)
         return Response(
             content=response_body,
             status_code=response.status_code,
-            headers=dict(response.headers),
+            headers=response_headers,
         )
 
     async def forward_gemini_request(self, request: Request) -> Response:
@@ -145,16 +171,36 @@ class GeminiProxyService:
             content=request.state.modified_body if hasattr(request.state, 'modified_body') else request.stream(),
             timeout=300.0,
         )
-        response = await client.send(req, stream=True)
-        if hasattr(response, "aiter_raw"):
+        # Get request type
+        request_type = self.get_request_type(request)
+        # Check if this is a streaming endpoint
+        is_streaming = request.url.path.endswith(":streamGenerateContent") or (
+            request_type == REQUEST_TYPE.OPENAI_COMPLETION and 
+            hasattr(request.state, 'stream') and request.state.stream
+        )
+        if is_streaming:
+            # For streaming responses, use stream=True
+            response = await client.send(req, stream=True)
+            # Get response headers
+            response_headers = dict(response.headers)
+            # For streaming responses, return the raw stream
+            # Compression will be handled by the client
             return StreamingResponse(
                 response.aiter_raw(),
                 status_code=response.status_code,
-                headers=dict(response.headers),
+                headers=strip_compression_headers(response_headers),
             )
-        response_body = await response.aread()
+        # For non-streaming responses, don't use stream=True
+        # This allows httpx to automatically handle decompression
+        response = await client.send(req, stream=False)
+        # Get response headers
+        response_headers = dict(response.headers)
+        # Read the response body (httpx should have already decompressed it)
+        response_body = response.content
+        # Strip compression headers since content is now decompressed
+        response_headers = strip_compression_headers(response_headers)
         return Response(
             content=response_body,
             status_code=response.status_code,
-            headers=dict(response.headers),
+            headers=response_headers,
         )

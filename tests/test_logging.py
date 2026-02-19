@@ -42,7 +42,7 @@ def test_logging_middleware_regular_response(client, mock_logger):
     """
     response = client.post("/regular", json={"message": "world"})
     assert response.status_code == 200
-    assert mock_logger.info.call_count == 5
+    assert mock_logger.info.call_count == 6  # Now includes response body logging
 
 
 def test_logging_middleware_streaming_response(client, mock_logger):
@@ -51,4 +51,4 @@ def test_logging_middleware_streaming_response(client, mock_logger):
     """
     response = client.post("/streaming", json={"message": "world"})
     assert response.status_code == 200
-    assert mock_logger.info.call_count == 5
+    assert mock_logger.info.call_count == 6  # Now includes response body logging
