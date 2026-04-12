@@ -15,7 +15,7 @@ VALID_API_KEY = "test-proxy-key"
 def client():
     api_keys = ["dummy-gemini-key"]
     app = FastAPI()
-    proxy = GeminiProxyService(gemini_api_keys=api_keys)
+    proxy = GeminiProxyService(api_keys=api_keys)
 
     proxy_api_keys = [VALID_API_KEY]
     auth_middleware_with_key = partial(

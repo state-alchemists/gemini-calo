@@ -14,7 +14,7 @@ VALID_API_KEY = "test-proxy-key"
 def client():
     api_keys = ["dummy-gemini-key"]
     app = FastAPI()
-    proxy = GeminiProxyService(gemini_api_keys=api_keys)
+    proxy = GeminiProxyService(api_keys=api_keys)
 
     app.include_router(proxy.gemini_router)
     app.include_router(proxy.openai_router)

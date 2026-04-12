@@ -18,7 +18,7 @@ def start_server():
         raise ValueError("GEMINI_CALO_API_KEYS is empty")
 
     app = FastAPI()
-    proxy = GeminiProxyService(gemini_api_keys=GEMINI_API_KEYS)
+    proxy = GeminiProxyService(api_keys=GEMINI_API_KEYS)
 
     app.middleware("http")(create_logging_middleware())
     app.middleware("http")(create_auth_middleware(PROXY_API_KEYS))

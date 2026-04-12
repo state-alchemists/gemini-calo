@@ -25,7 +25,7 @@ def create_gzipped_content(content: str) -> bytes:
 def proxy_client():
     """Fixture to create a TestClient with the proxy."""
     app = FastAPI()
-    proxy = GeminiProxyService(gemini_api_keys=["dummy-gemini-key"])
+    proxy = GeminiProxyService(api_keys=["dummy-gemini-key"])
     app.include_router(proxy.gemini_router)
     app.include_router(proxy.openai_router)
     return TestClient(app)
@@ -35,7 +35,7 @@ def proxy_client():
 def logging_client():
     """Fixture to create a TestClient with logging middleware."""
     app = FastAPI()
-    proxy = GeminiProxyService(gemini_api_keys=["dummy-gemini-key"])
+    proxy = GeminiProxyService(api_keys=["dummy-gemini-key"])
     app.middleware("http")(create_logging_middleware())
     app.include_router(proxy.gemini_router)
     app.include_router(proxy.openai_router)
@@ -47,7 +47,7 @@ def rollup_client():
     """Fixture to create a TestClient with rollup middleware."""
     from cachetools import LRUCache
     app = FastAPI()
-    proxy = GeminiProxyService(gemini_api_keys=["dummy-gemini-key"])
+    proxy = GeminiProxyService(api_keys=["dummy-gemini-key"])
     lru_cache = LRUCache(maxsize=128)
     app.middleware("http")(
         create_rollup_middleware(gemini_proxy=proxy, lru_cache=lru_cache)
@@ -194,7 +194,7 @@ def test_proxy_handles_malformed_gzip(proxy_client, httpx_mock):
 
 def test_http_client_disables_gzip_by_default():
     """Test that HTTP client is configured to handle gzip properly."""
-    proxy = GeminiProxyService(gemini_api_keys=["dummy-key"])
+    proxy = GeminiProxyService(api_keys=["dummy-key"])
     client = proxy.get_httpx_client()
     
     # Check that client accepts gzip encoding

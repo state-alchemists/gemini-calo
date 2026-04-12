@@ -19,7 +19,7 @@ def client(request):
     Fixture to create a TestClient with the middleware.
     """
     app = FastAPI()
-    proxy = GeminiProxyService(gemini_api_keys=["dummy-gemini-key"])
+    proxy = GeminiProxyService(api_keys=["dummy-gemini-key"])
 
     lru_cache = LRUCache(maxsize=128)
     app.middleware("http")(

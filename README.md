@@ -9,7 +9,8 @@ One of its key features is providing an OpenAI-compatible endpoint, allowing you
 *   **Authentication:** Secure your Gemini API access with an additional layer of API key authentication.
 *   **Request Logging:** Detailed logging of all incoming requests and outgoing responses.
 *   **OpenAI Compatibility:** Use Gemini models through an OpenAI-compatible `/v1/chat/completions` endpoint.
-*   **Round-Robin API Keys:** Distribute your requests across multiple Gemini API keys.
+*   **Round-Robin API Keys:** Distribute your requests across multiple API keys, both globally and per model route.
+*   **Multi-Provider Routing:** Route specific models (via glob patterns) to different upstream providers — use OpenAI, Anthropic, or any OpenAI-compatible endpoint alongside Gemini.
 *   **Easy Integration:** Use it as a standalone server or mount it into your existing FastAPI project.
 *   **Extensible:** Easily add your own custom middleware to suit your needs.
 
@@ -36,23 +37,13 @@ pip install gemini-calo
 
 The server is configured through environment variables. You can create a `.env` file in your working directory to store them.
 
-*   `GEMINI_CALO_API_KEYS`: A comma-separated list of your Google Gemini API keys. The proxy will rotate through these keys for outgoing requests. If this is not set, the proxy will not be able to make requests to the Gemini API.
-*   `GEMINI_CALO_PROXY_API_KEYS`: (Optional) A comma-separated list of API keys that clients must provide to use the proxy. If not set, the proxy will be open to anyone, meaning no API key is required for access.
+*   `GEMINI_CALO_API_KEYS`: A comma-separated list of your Google Gemini API keys. The proxy will rotate through these keys for outgoing requests. Required when using the built-in server.
+*   `GEMINI_CALO_PROXY_API_KEYS`: (Optional) A comma-separated list of API keys that clients must provide to use the proxy. If not set, the proxy accepts all requests without authentication.
 *   `GEMINI_CALO_HTTP_PORT`: The port on which the server will run. Defaults to `8000`.
-*   `GEMINI_CALO_LOG_LEVEL`: Sets the logging level for the application. Options include `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. If not set, it defaults to `CRITICAL`.
+*   `GEMINI_CALO_LOG_LEVEL`: Sets the logging level. Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Defaults to `CRITICAL`.
 *   `GEMINI_CALO_LOG_FILE`: Specifies the file where logs will be written. Defaults to `app.log`.
-*   `GEMINI_CALO_CONVERSATION_SUMMARIZATION_LRU_CACHE`: Sets the size of the LRU cache for conversation summarization. Defaults to `20`.
-*   `GEMINI_CALO_MODEL_OVERRIDE`: Allows you to specify a model to override the default Gemini model.
-*   `PY_IGNORE_IMPORTMISMATCH`: (Used by `pydantic-ai`) If set, ignores import mismatches.
-*   `PYTEST_THEME`: (Used by `pytest-sugar`) Sets the theme for pytest output.
-*   `PYTEST_THEME_MODE`: (Used by `pytest-sugar`) Sets the theme mode (e.g., `dark`) for pytest output.
-*   `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CONFIG_DIRS`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`: Standard XDG base directory environment variables.
-*   `DISTUTILS_USE_SDK`: (Used by `setuptools`) If set, indicates whether to use the SDK.
-*   `SETUPTOOLS_EXT_SUFFIX`: (Used by `setuptools`) Specifies the suffix for extension modules.
-*   `PYDANTIC_PRIVATE_ALLOW_UNHANDLED_SCHEMA_TYPES`: (Used by `pydantic`) Allows unhandled schema types.
-*   `PYDANTIC_DISABLE_PLUGINS`: (Used by `pydantic`) Disables pydantic plugins.
-*   `PYDANTIC_VALIDATE_CORE_SCHEMAS`: (Used by `pydantic`) Enables validation of core schemas.
-*   `EXCEPTIONGROUP_NO_PATCH`: (Used by `exceptiongroup`) If set, prevents patching of the `ExceptionGroup` class.
+*   `GEMINI_CALO_CONVERSATION_SUMMARIZATION_LRU_CACHE`: Size of the LRU cache for conversation summarization. Defaults to `20`.
+*   `GEMINI_CALO_MODEL_OVERRIDE`: Forces all requests to use a specific model name, overriding whatever the client sends.
 
 **Example `.env` file:**
 
@@ -95,8 +86,8 @@ import os
 app = FastAPI()
 
 # 1. Initialize the GeminiProxyService
-gemini_api_keys = os.getenv("GEMINI_CALO_API_KEYS", "").split(",")
-proxy_service = GeminiProxyService(gemini_api_keys=gemini_api_keys)
+api_keys = os.getenv("GEMINI_CALO_API_KEYS", "").split(",")
+proxy_service = GeminiProxyService(api_keys=api_keys)
 
 # 2. (Optional) Add Authentication Middleware
 proxy_api_keys = os.getenv("GEMINI_CALO_PROXY_API_KEYS", "").split(",")
@@ -118,6 +109,54 @@ def health_check():
 # Now you can run your app as usual with uvicorn
 # uvicorn your_app_file:app --reload
 ```
+
+## Routing Models to Different Providers
+
+`GeminiProxyService` supports a `model_routes` parameter — a `dict` that maps glob patterns to a `RouteConfig`. When a request arrives, the proxy extracts the model name (from the URL path for Gemini-format requests, or from the JSON body for OpenAI-format requests) and checks it against each pattern in order. The first match wins; unmatched models fall back to `base_url` + `api_keys`.
+
+### `RouteConfig` fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `url` | `str` | — | Upstream base URL for this route |
+| `api_keys` | `list[str]` | — | Keys rotated round-robin for this route |
+| `auth_type` | `"bearer"` \| `"x-goog-api-key"` | `"bearer"` | Header used to send the API key |
+| `timeout` | `float` | `300.0` | Per-request timeout in seconds |
+
+### Example: mixing Gemini and OpenAI
+
+```python
+import os
+from fastapi import FastAPI
+from gemini_calo.proxy import GeminiProxyService, RouteConfig
+
+app = FastAPI()
+
+proxy = GeminiProxyService(
+    base_url="https://generativelanguage.googleapis.com",
+    api_keys=["gemini-key-1", "gemini-key-2"],  # default: round-robined for unmatched models
+    model_routes={
+        # Glob pattern → RouteConfig
+        "gpt-4*": RouteConfig(
+            url="https://api.openai.com",
+            api_keys=["openai-key-1", "openai-key-2"],
+            auth_type="bearer",
+        ),
+        "claude-*": RouteConfig(
+            url="https://api.anthropic.com",
+            api_keys=["anthropic-key-1"],
+            auth_type="bearer",
+            timeout=600.0,
+        ),
+        # Gemini requests not matched above use base_url + api_keys
+    },
+)
+
+app.include_router(proxy.gemini_router)
+app.include_router(proxy.openai_router)
+```
+
+Pattern matching uses Python's `fnmatch`, so `*` matches any substring within a segment and `?` matches a single character. Patterns are checked in insertion order — the first match wins.
 
 ## How the Middleware Works
 

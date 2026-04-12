@@ -19,7 +19,7 @@ def client(request):
     """
     model_transformer = getattr(request, "param", None)
     app = FastAPI()
-    proxy = GeminiProxyService(gemini_api_keys=["dummy-gemini-key"])
+    proxy = GeminiProxyService(api_keys=["dummy-gemini-key"])
 
     if model_transformer:
         app.middleware("http")(
@@ -103,7 +103,7 @@ def test_env_var_override(monkeypatch, httpx_mock):
     importlib.reload(config)
 
     client = TestClient(FastAPI())
-    proxy = GeminiProxyService(gemini_api_keys=["dummy-gemini-key"])
+    proxy = GeminiProxyService(api_keys=["dummy-gemini-key"])
     client.app.middleware("http")(create_model_override_middleware())
     client.app.include_router(proxy.gemini_router)
     client.app.include_router(proxy.openai_router)
