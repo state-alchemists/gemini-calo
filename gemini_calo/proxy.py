@@ -52,6 +52,18 @@ class GeminiProxyService:
 
     def _add_routes(self):
         self.openai_router.add_api_route(
+            "/v1/chat/completions",
+            self.forward_openai_request,
+            methods=["POST"],
+            response_model=Any,
+        )
+        self.openai_router.add_api_route(
+            "/v1/embeddings",
+            self.forward_openai_request,
+            methods=["POST"],
+            response_model=Any,
+        )
+        self.openai_router.add_api_route(
             "/v1beta/openai/chat/completions",
             self.forward_openai_request,
             methods=["POST"],
@@ -90,9 +102,9 @@ class GeminiProxyService:
 
     @classmethod
     def get_request_type(cls, request: Request) -> str:
-        if request.url.path == "/v1beta/openai/chat/completions":
+        if request.url.path in ("/v1/chat/completions", "/v1beta/openai/chat/completions"):
             return REQUEST_TYPE.OPENAI_COMPLETION
-        if request.url.path == "/v1beta/openai/embeddings":
+        if request.url.path in ("/v1/embeddings", "/v1beta/openai/embeddings"):
             return REQUEST_TYPE.OPENAI_EMBEDDING
         if request.url.path.startswith("/v1beta/models/"):
             if request.url.path.endswith(":generateContent"):
@@ -195,7 +207,16 @@ class GeminiProxyService:
     async def forward_openai_request(self, request: Request) -> Response:
         """Forward openai request"""
         client, auth_headers, timeout = await self._resolve_upstream(request, "bearer")
-        url = httpx.URL(path=request.url.path, query=request.url.query.encode("utf-8"))
+        path = request.url.path
+        # Map standard OpenAI paths to Gemini-OpenAI paths only if target is Google
+        is_google = str(client.base_url).startswith("https://generativelanguage.googleapis.com")
+        if is_google:
+            if path == "/v1/chat/completions":
+                path = "/v1beta/openai/chat/completions"
+            elif path == "/v1/embeddings":
+                path = "/v1beta/openai/embeddings"
+
+        url = httpx.URL(path=path, query=request.url.query.encode("utf-8"))
         headers = {"Content-Type": "application/json", **auth_headers}
         logger.info(f"Forwarding OpenAI request to: {url}")
         req = client.build_request(
