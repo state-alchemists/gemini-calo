@@ -139,6 +139,10 @@ async def rollup_middleware(
     except json.JSONDecodeError:
         response_json = {}
 
+    # Handle case where response_json might be a list (from streaming responses)
+    if not isinstance(response_json, dict):
+        response_json = {}
+
     assistant_message = {}
     if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
         choice = response_json.get("choices", [{}])[0]
