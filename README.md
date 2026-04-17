@@ -11,6 +11,7 @@ One of its key features is providing an OpenAI-compatible endpoint, allowing you
 *   **OpenAI Compatibility:** Use Gemini models through an OpenAI-compatible `/v1/chat/completions` endpoint.
 *   **Round-Robin API Keys:** Distribute your requests across multiple API keys, both globally and per model route.
 *   **Multi-Provider Routing:** Route specific models (via glob patterns) to different upstream providers — use OpenAI, Anthropic, or any OpenAI-compatible endpoint alongside Gemini.
+*   **Extensible Authentication:** Support for complex auth schemes like AWS SigV4, OAuth, or custom providers via pluggable auth modules.
 *   **Easy Integration:** Use it as a standalone server or mount it into your existing FastAPI project.
 *   **Extensible:** Easily add your own custom middleware to suit your needs.
 
@@ -119,9 +120,21 @@ def health_check():
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `url` | `str` | — | Upstream base URL for this route |
-| `api_keys` | `list[str]` | — | Keys rotated round-robin for this route |
-| `auth_type` | `"bearer"` \| `"x-goog-api-key"` | `"bearer"` | Header used to send the API key |
+| `api_keys` | `list[str]` | `[]` | Keys rotated round-robin for preset auth types |
+| `auth` | `str` \| `callable` \| `None` | `"bearer"` | Authentication configuration (see below) |
 | `timeout` | `float` | `300.0` | Per-request timeout in seconds |
+| `auth_type` | `"bearer"` \| `"x-goog-api-key"` | — | **Deprecated:** Use `auth` instead |
+
+### Authentication Configuration
+
+The `auth` field supports multiple authentication modes:
+
+| Value | Description |
+|-------|-------------|
+| `"bearer"` | Uses `api_keys` with `Authorization: Bearer <key>` header (round-robin) |
+| `"x-goog-api-key"` | Uses `api_keys` with `x-goog-api-key` header (round-robin) |
+| `"none"` or `None` | No authentication headers added |
+| `callable` | Custom auth provider function for advanced scenarios |
 
 ### Example: mixing Gemini and OpenAI
 
@@ -140,12 +153,12 @@ proxy = GeminiProxyService(
         "gpt-4*": RouteConfig(
             url="https://api.openai.com",
             api_keys=["openai-key-1", "openai-key-2"],
-            auth_type="bearer",
+            auth="bearer",
         ),
         "claude-*": RouteConfig(
             url="https://api.anthropic.com",
             api_keys=["anthropic-key-1"],
-            auth_type="bearer",
+            auth="bearer",
             timeout=600.0,
         ),
         # Gemini requests not matched above use base_url + api_keys
@@ -157,6 +170,97 @@ app.include_router(proxy.openai_router)
 ```
 
 Pattern matching uses Python's `fnmatch`, so `*` matches any substring within a segment and `?` matches a single character. Patterns are checked in insertion order — the first match wins.
+
+## Advanced Authentication: Custom Auth Providers
+
+For providers that require more complex authentication (like AWS Bedrock with SigV4 signing), you can provide a custom auth provider function. This function receives the incoming request and returns an `httpx.Auth` instance.
+
+### AWS Bedrock with Static Credentials
+
+```python
+from fastapi import FastAPI
+from gemini_calo.proxy import GeminiProxyService, RouteConfig
+from gemini_calo.auth import AWSCredentials, create_aws_sigv4_provider
+
+app = FastAPI()
+
+# Define your AWS credentials
+bedrock_creds = AWSCredentials(
+    access_key="AKIAIOSFODNN7EXAMPLE",
+    secret_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    region="us-east-1",
+    service="bedrock",
+)
+
+proxy = GeminiProxyService(
+    base_url="https://generativelanguage.googleapis.com",
+    api_keys=["gemini-key"],
+    model_routes={
+        "bedrock-*": RouteConfig(
+            url="https://bedrock-runtime.us-east-1.amazonaws.com",
+            api_keys=[],  # Not used for AWS auth
+            auth=create_aws_sigv4_provider(bedrock_creds),
+        ),
+    },
+)
+
+app.include_router(proxy.gemini_router)
+app.include_router(proxy.openai_router)
+```
+
+### AWS Bedrock with Pass-Through Credentials
+
+When each client has their own AWS credentials, use pass-through authentication:
+
+```python
+from gemini_calo.auth import create_passthrough_aws_provider
+
+proxy = GeminiProxyService(
+    base_url="https://generativelanguage.googleapis.com",
+    api_keys=["gemini-key"],
+    model_routes={
+        "bedrock-*": RouteConfig(
+            url="https://bedrock-runtime.us-east-1.amazonaws.com",
+            api_keys=[],
+            auth=create_passthrough_aws_provider(
+                required=True,  # Raise error if credentials missing
+                default_region="us-east-1",
+                service="bedrock",
+            ),
+        ),
+    },
+)
+
+# Clients must send these headers:
+# X-AWS-Access-Key: AKIA...
+# X-AWS-Secret-Key: ...
+# X-AWS-Region: us-east-1 (optional)
+# X-AWS-Session-Token: ... (optional, for temporary credentials)
+```
+
+### Custom Auth Provider Example
+
+You can create your own auth provider for any authentication scheme:
+
+```python
+import httpx
+from fastapi import Request
+from gemini_calo.auth import BearerAuth
+
+async def custom_auth_provider(request: Request) -> httpx.Auth:
+    """Example: Extract token from custom header and use as bearer token."""
+    custom_token = request.headers.get("X-My-Custom-Token", "default-token")
+    return BearerAuth(token=custom_token)
+
+# Use in RouteConfig
+route = RouteConfig(
+    url="https://api.example.com",
+    api_keys=[],
+    auth=custom_auth_provider,
+)
+```
+
+
 
 ## How the Middleware Works
 
@@ -319,5 +423,68 @@ Once you set up everything, you can start interacting with Zrb.
 
 ```bash
 # Run `zrb llm ask` or `zrb llm chat`
-zrb llm ask "What is the current weather at my current location?"
+zrb chat "What is the current weather at my current location?"
 ```
+
+## Development & Testing
+
+### Running Tests
+
+Clone the repository and install development dependencies:
+
+```bash
+git clone https://github.com/state-alchemists/gemini-calo.git
+cd gemini-calo
+pip install -e ".[dev]"
+```
+
+Run the test suite:
+
+```bash
+# Run all tests
+python -m pytest tests/ -v
+
+# Run specific test file
+python -m pytest tests/test_auth_providers.py -v
+
+# Run specific test
+python -m pytest tests/test_auth_providers.py::test_create_bearer_provider_rotates_keys -v
+```
+
+### Code Coverage
+
+Run tests with coverage report:
+
+```bash
+# Run with coverage
+python -m pytest tests/ --cov=gemini_calo --cov-report=term-missing
+
+# Generate HTML coverage report
+python -m pytest tests/ --cov=gemini_calo --cov-report=html
+open htmlcov/index.html
+```
+
+Current coverage: **76%**
+
+### Optional Dependencies
+
+For AWS SigV4 authentication tests, install `botocore`:
+
+```bash
+pip install botocore
+```
+
+Tests that require `botocore` are automatically skipped if it's not installed.
+
+### Test Structure
+
+| File | Purpose |
+|------|---------|
+| `test_auth.py` | Proxy authentication middleware tests |
+| `test_auth_providers.py` | Auth module tests (Bearer, XGoog, AWS SigV4) |
+| `test_gzip_handling.py` | Gzip compression handling tests |
+| `test_logging.py` | Logging middleware tests |
+| `test_main.py` | Main proxy functionality tests |
+| `test_model_override.py` | Model override middleware tests |
+| `test_model_routes.py` | Model routing and RouteConfig tests |
+| `test_rollup.py` | Conversation rollup tests |
