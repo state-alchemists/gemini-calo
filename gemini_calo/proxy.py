@@ -3,29 +3,32 @@ import json
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal, Union, Callable, Awaitable
+from typing import Any, Awaitable, Callable, Literal, Union
 
 import httpx
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
 
-from gemini_calo.logger import logger
-from gemini_calo.util.request import create_http_client, strip_compression_headers
 from gemini_calo.auth import (
     AuthConfig,
     AuthProviderFunc,
     BearerAuth,
-    XGoogApiKeyAuth,
     NoAuth,
+    XGoogApiKeyAuth,
     create_bearer_provider,
+    create_passthrough_bedrock_provider,
     create_xgoog_provider,
 )
+from gemini_calo.logger import logger
+from gemini_calo.util.request import create_http_client, strip_compression_headers
+
+_default_bedrock_passthrough = create_passthrough_bedrock_provider()
 
 
 @dataclass
 class RouteConfig:
     """Configuration for routing requests to a specific upstream provider.
-    
+
     Attributes:
         url: The base URL for the upstream provider.
         api_keys: List of API keys to rotate through (used by preset auth types).
@@ -38,18 +41,23 @@ class RouteConfig:
         timeout: Request timeout in seconds.
         auth_type: DEPRECATED - Use auth instead. Kept for backward compatibility.
     """
+
     url: str
     api_keys: list[str] = field(default_factory=list)
     auth: AuthConfig = "bearer"
     timeout: float = 300.0
-    
+
     # Deprecated field for backward compatibility
-    auth_type: Literal["bearer", "x-goog-api-key"] | None = field(default=None, repr=False)
-    
+    auth_type: Literal["bearer", "x-goog-api-key"] | None = field(
+        default=None, repr=False
+    )
+
     # Internal state
     _current_index: int = field(default=0, init=False, repr=False)
-    _auth_provider: AuthProviderFunc | None = field(default=None, init=False, repr=False)
-    
+    _auth_provider: AuthProviderFunc | None = field(
+        default=None, init=False, repr=False
+    )
+
     def __post_init__(self):
         # Handle deprecated auth_type
         if self.auth_type is not None:
@@ -62,10 +70,10 @@ class RouteConfig:
             # Only override auth if auth is still default and auth_type was explicitly set
             if self.auth == "bearer":
                 self.auth = self.auth_type
-        
+
         # Convert preset strings to provider callables
         self._auth_provider = self._create_auth_provider()
-    
+
     def _create_auth_provider(self) -> AuthProviderFunc:
         """Create the internal auth provider based on auth config."""
         if self.auth is None or self.auth == "none":
@@ -90,14 +98,14 @@ class RouteConfig:
             return self.auth
         else:
             raise ValueError(f"Invalid auth config: {self.auth}")
-    
+
     @staticmethod
     async def _no_auth_provider(request: Request) -> httpx.Auth:
         return NoAuth()
-    
+
     def get_api_key(self) -> str:
         """Get the next API key in round-robin order.
-        
+
         Kept for backward compatibility. For new code, use get_auth() instead.
         """
         if not self.api_keys:
@@ -105,13 +113,13 @@ class RouteConfig:
         key = self.api_keys[self._current_index]
         self._current_index = (self._current_index + 1) % len(self.api_keys)
         return key
-    
+
     async def get_auth(self, request: Request) -> httpx.Auth:
         """Get the httpx.Auth for authenticating the outgoing request.
-        
+
         Args:
             request: The incoming FastAPI request (used for pass-through auth).
-            
+
         Returns:
             An httpx.Auth instance to sign the outgoing request.
         """
@@ -124,6 +132,8 @@ class REQUEST_TYPE(Enum):
     GEMINI_COMPLETION: str = "gemini-completion"
     GEMINI_STREAMING_COMPLETION: str = "gemini-streaming-completion"
     GEMINI_EMBEDDING: str = "gemini-embedding"
+    BEDROCK_INVOKE: str = "bedrock-invoke"
+    BEDROCK_STREAMING_INVOKE: str = "bedrock-streaming-invoke"
     OTHER: str = "other"
 
 
@@ -140,6 +150,7 @@ class GeminiProxyService:
         self._model_routes = model_routes
         self.openai_router = APIRouter()
         self.gemini_router = APIRouter()
+        self.bedrock_router = APIRouter()
         self._add_routes()
 
     def _add_routes(self):
@@ -191,10 +202,25 @@ class GeminiProxyService:
             methods=["GET"],
             response_model=Any,
         )
+        self.bedrock_router.add_api_route(
+            "/model/{model_id:path}/invoke",
+            self.forward_bedrock_request,
+            methods=["POST"],
+            response_model=Any,
+        )
+        self.bedrock_router.add_api_route(
+            "/model/{model_id:path}/invoke-with-response-stream",
+            self.forward_bedrock_request,
+            methods=["POST"],
+            response_model=Any,
+        )
 
     @classmethod
     def get_request_type(cls, request: Request) -> str:
-        if request.url.path in ("/v1/chat/completions", "/v1beta/openai/chat/completions"):
+        if request.url.path in (
+            "/v1/chat/completions",
+            "/v1beta/openai/chat/completions",
+        ):
             return REQUEST_TYPE.OPENAI_COMPLETION
         if request.url.path in ("/v1/embeddings", "/v1beta/openai/embeddings"):
             return REQUEST_TYPE.OPENAI_EMBEDDING
@@ -205,6 +231,11 @@ class GeminiProxyService:
                 return REQUEST_TYPE.GEMINI_STREAMING_COMPLETION
             if request.url.path.endswith(":embedContent"):
                 return REQUEST_TYPE.GEMINI_EMBEDDING
+        if request.url.path.startswith("/model/"):
+            if request.url.path.endswith("/invoke-with-response-stream"):
+                return REQUEST_TYPE.BEDROCK_STREAMING_INVOKE
+            if request.url.path.endswith("/invoke"):
+                return REQUEST_TYPE.BEDROCK_INVOKE
         return REQUEST_TYPE.OTHER
 
     def get_api_key(self) -> str:
@@ -239,11 +270,25 @@ class GeminiProxyService:
                 return after_models.rsplit(":", 1)[0]
             except (IndexError, ValueError):
                 return None
-        elif request_type in (REQUEST_TYPE.OPENAI_COMPLETION, REQUEST_TYPE.OPENAI_EMBEDDING):
+        elif request_type in (
+            REQUEST_TYPE.OPENAI_COMPLETION,
+            REQUEST_TYPE.OPENAI_EMBEDDING,
+        ):
             try:
                 body = await request.body()
                 return json.loads(body).get("model")
             except (json.JSONDecodeError, Exception):
+                return None
+        elif request_type in (
+            REQUEST_TYPE.BEDROCK_INVOKE,
+            REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+        ):
+            path = request.url.path
+            try:
+                # /model/{model_id}/invoke  or  /model/{model_id}/invoke-with-response-stream
+                after_model = path.split("/model/", 1)[1]
+                return after_model.rsplit("/", 1)[0]
+            except (IndexError, ValueError):
                 return None
         return None
 
@@ -262,13 +307,13 @@ class GeminiProxyService:
     ) -> tuple[httpx.AsyncClient, httpx.Auth | None, float]:
         """
         Returns (client, auth, timeout) for the upstream request.
-        
+
         Checks model_routes first (glob-matched), falls back to base_url + api_keys.
         Auth is now an httpx.Auth instance that handles request signing.
         """
         model_name = await self._extract_model_name(request)
         route = self._find_route(model_name)
-        
+
         if route:
             logger.info(f"Routing model '{model_name}' to {route.url}")
             client = create_http_client(
@@ -287,7 +332,7 @@ class GeminiProxyService:
             follow_redirects=False,
             timeout=300.0,
         )
-        
+
         # Create auth based on default_auth preset
         if self._api_keys:
             if default_auth == "bearer":
@@ -296,16 +341,18 @@ class GeminiProxyService:
                 auth = XGoogApiKeyAuth(api_key=self.get_api_key())
         else:
             auth = None
-        
+
         return client, auth, 300.0
 
     async def forward_openai_request(self, request: Request) -> Response:
         """Forward openai request"""
         client, auth, timeout = await self._resolve_upstream(request, "bearer")
         path = request.url.path
-        
+
         # Map standard OpenAI paths to Gemini-OpenAI paths only if target is Google
-        is_google = str(client.base_url).startswith("https://generativelanguage.googleapis.com")
+        is_google = str(client.base_url).startswith(
+            "https://generativelanguage.googleapis.com"
+        )
         if is_google:
             if path == "/v1/chat/completions":
                 path = "/v1beta/openai/chat/completions"
@@ -313,22 +360,22 @@ class GeminiProxyService:
                 path = "/v1beta/openai/embeddings"
 
         url = httpx.URL(path=path, query=request.url.query.encode("utf-8"))
-        
+
         # Start with content-type header; auth will be added by httpx.Auth
         headers = {"Content-Type": "application/json"}
-        
+
         # Add any other headers from the original request that should be forwarded
         # (excluding auth headers which are handled by the auth provider)
-        
+
         logger.info(f"Forwarding OpenAI request to: {url}")
-        
+
         # Get request body
         content = (
-            request.state.modified_body 
-            if hasattr(request.state, "modified_body") 
+            request.state.modified_body
+            if hasattr(request.state, "modified_body")
             else request.stream()
         )
-        
+
         req = client.build_request(
             request.method,
             url,
@@ -336,7 +383,7 @@ class GeminiProxyService:
             content=content,
             timeout=timeout,
         )
-        
+
         # Determine if streaming
         request_type = self.get_request_type(request)
         is_streaming = request.url.path.endswith(":streamGenerateContent") or (
@@ -344,43 +391,69 @@ class GeminiProxyService:
             and hasattr(request.state, "stream")
             and request.state.stream
         )
-        
+
         # Send with auth
         if auth:
             response = await client.send(req, auth=auth, stream=is_streaming)
         else:
             response = await client.send(req, stream=is_streaming)
-        
+
         if is_streaming:
             return StreamingResponse(
                 response.aiter_raw(),
                 status_code=response.status_code,
                 headers=strip_compression_headers(dict(response.headers)),
             )
-        
+
         return Response(
             content=response.content,
             status_code=response.status_code,
             headers=strip_compression_headers(dict(response.headers)),
         )
 
+    async def _resolve_bedrock_upstream(
+        self, request: Request
+    ) -> tuple[httpx.AsyncClient, httpx.Auth | None, float]:
+        model_name = await self._extract_model_name(request)
+        route = self._find_route(model_name)
+
+        if route:
+            logger.info(f"Routing Bedrock model '{model_name}' to {route.url}")
+            client = create_http_client(
+                base_url=route.url,
+                accept_compression=True,
+                follow_redirects=False,
+                timeout=route.timeout,
+            )
+            auth = await route.get_auth(request)
+            return client, auth, route.timeout
+
+        region = request.headers.get("x-aws-region", "us-east-1")
+        bedrock_url = f"https://bedrock-runtime.{region}.amazonaws.com"
+        client = create_http_client(
+            base_url=bedrock_url,
+            accept_compression=True,
+            follow_redirects=False,
+            timeout=300.0,
+        )
+        auth = await _default_bedrock_passthrough(request)
+        return client, auth, 300.0
+
     async def forward_gemini_request(self, request: Request) -> Response:
         """Forward gemini request"""
         client, auth, timeout = await self._resolve_upstream(request, "x-goog-api-key")
         url = httpx.URL(path=request.url.path, query=request.url.query.encode("utf-8"))
-        
-        # Start with content-type header; auth will be added by httpx.Auth
+
         headers = {"Content-Type": "application/json"}
-        
+
         logger.info(f"Forwarding Gemini request to: {url}")
-        
-        # Get request body
+
         content = (
-            request.state.modified_body 
-            if hasattr(request.state, "modified_body") 
+            request.state.modified_body
+            if hasattr(request.state, "modified_body")
             else request.stream()
         )
-        
+
         req = client.build_request(
             request.method,
             url,
@@ -388,28 +461,71 @@ class GeminiProxyService:
             content=content,
             timeout=timeout,
         )
-        
-        # Determine if streaming
+
         request_type = self.get_request_type(request)
         is_streaming = request.url.path.endswith(":streamGenerateContent") or (
             request_type == REQUEST_TYPE.OPENAI_COMPLETION
             and hasattr(request.state, "stream")
             and request.state.stream
         )
-        
-        # Send with auth
+
         if auth:
             response = await client.send(req, auth=auth, stream=is_streaming)
         else:
             response = await client.send(req, stream=is_streaming)
-        
+
         if is_streaming:
             return StreamingResponse(
                 response.aiter_raw(),
                 status_code=response.status_code,
                 headers=strip_compression_headers(dict(response.headers)),
             )
-        
+
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=strip_compression_headers(dict(response.headers)),
+        )
+
+    async def forward_bedrock_request(self, request: Request) -> Response:
+        """Forward AWS Bedrock runtime request."""
+        client, auth, timeout = await self._resolve_bedrock_upstream(request)
+        url = httpx.URL(path=request.url.path, query=request.url.query.encode("utf-8"))
+
+        headers = {"Content-Type": "application/json"}
+
+        logger.info(f"Forwarding Bedrock request to: {url}")
+
+        content = (
+            request.state.modified_body
+            if hasattr(request.state, "modified_body")
+            else request.stream()
+        )
+
+        req = client.build_request(
+            request.method,
+            url,
+            headers=headers,
+            content=content,
+            timeout=timeout,
+        )
+
+        is_streaming = (
+            self.get_request_type(request) == REQUEST_TYPE.BEDROCK_STREAMING_INVOKE
+        )
+
+        if auth:
+            response = await client.send(req, auth=auth, stream=is_streaming)
+        else:
+            response = await client.send(req, stream=is_streaming)
+
+        if is_streaming:
+            return StreamingResponse(
+                response.aiter_raw(),
+                status_code=response.status_code,
+                headers=strip_compression_headers(dict(response.headers)),
+            )
+
         return Response(
             content=response.content,
             status_code=response.status_code,

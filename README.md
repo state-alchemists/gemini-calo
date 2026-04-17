@@ -2,15 +2,16 @@
 
 **Gemini Calo** is a powerful, yet simple, FastAPI-based proxy server for Google's Gemini API. It provides a seamless way to add a layer of authentication, logging, and monitoring to your Gemini API requests. It's designed to be run as a standalone server or integrated into your existing FastAPI applications.
 
-One of its key features is providing an OpenAI-compatible endpoint, allowing you to use Gemini models with tools and libraries that are built for the OpenAI API.
+One of its key features is providing an OpenAI-compatible endpoint, allowing you to use Gemini models with tools and libraries that are built for the OpenAI API. It also exposes a native **AWS Bedrock-compatible endpoint** (`/model/{modelId}/invoke`), so any client that targets `bedrock-runtime` works without changes.
 
 ## Key Features
 
 *   **Authentication:** Secure your Gemini API access with an additional layer of API key authentication.
 *   **Request Logging:** Detailed logging of all incoming requests and outgoing responses.
 *   **OpenAI Compatibility:** Use Gemini models through an OpenAI-compatible `/v1/chat/completions` endpoint.
+*   **AWS Bedrock Compatibility:** Native Bedrock endpoint (`/model/{modelId}/invoke` and `/model/{modelId}/invoke-with-response-stream`) — supports both Bedrock API key (bearer token) and SigV4 signing.
 *   **Round-Robin API Keys:** Distribute your requests across multiple API keys, both globally and per model route.
-*   **Multi-Provider Routing:** Route specific models (via glob patterns) to different upstream providers — use OpenAI, Anthropic, or any OpenAI-compatible endpoint alongside Gemini.
+*   **Multi-Provider Routing:** Route specific models (via glob patterns) to different upstream providers — use OpenAI, Anthropic, AWS Bedrock, or any OpenAI-compatible endpoint alongside Gemini.
 *   **Extensible Authentication:** Support for complex auth schemes like AWS SigV4, OAuth, or custom providers via pluggable auth modules.
 *   **Easy Integration:** Use it as a standalone server or mount it into your existing FastAPI project.
 *   **Extensible:** Easily add your own custom middleware to suit your needs.
@@ -99,9 +100,10 @@ if proxy_api_keys:
 # 3. (Optional) Add Logging Middleware
 app.middleware("http")(logging_middleware)
 
-# 4. Mount the Gemini and OpenAI routers
+# 4. Mount the Gemini, OpenAI, and Bedrock routers
 app.include_router(proxy_service.gemini_router)
 app.include_router(proxy_service.openai_router)
+app.include_router(proxy_service.bedrock_router)
 
 @app.get("/health")
 def health_check():
@@ -167,76 +169,128 @@ proxy = GeminiProxyService(
 
 app.include_router(proxy.gemini_router)
 app.include_router(proxy.openai_router)
+app.include_router(proxy.bedrock_router)
 ```
 
 Pattern matching uses Python's `fnmatch`, so `*` matches any substring within a segment and `?` matches a single character. Patterns are checked in insertion order — the first match wins.
 
-## Advanced Authentication: Custom Auth Providers
+## AWS Bedrock Endpoint
 
-For providers that require more complex authentication (like AWS Bedrock with SigV4 signing), you can provide a custom auth provider function. This function receives the incoming request and returns an `httpx.Auth` instance.
+Gemini Calo exposes a native Bedrock-compatible endpoint. Any client targeting `bedrock-runtime` can point at the proxy instead with minimal or no code changes.
 
-### AWS Bedrock with Static Credentials
+### Supported routes
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/model/{modelId}/invoke` | Synchronous invocation |
+| `POST` | `/model/{modelId}/invoke-with-response-stream` | Streaming invocation |
+
+### Authentication options
+
+Clients authenticate with the upstream Bedrock service by sending one of the following sets of headers:
+
+| Scenario | Headers to send | How the proxy signs the upstream request |
+|----------|-----------------|------------------------------------------|
+| Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK`) | `X-AWS-Bearer-Token: <token>` | `Authorization: Bearer <token>` (no signing) |
+| IAM credentials (SigV4) | `X-AWS-Access-Key`, `X-AWS-Secret-Key` (+ optional `X-AWS-Session-Token`, `X-AWS-Region`) | AWSSig4-signed request |
+
+The proxy auto-detects which path to use: bearer token takes priority over SigV4. If neither is present, the request is forwarded unsigned.
+
+The upstream URL is built dynamically from the `X-AWS-Region` header (default: `us-east-1`) unless the model is matched by a `model_routes` entry that provides a fixed URL.
+
+### Example: proxy as a Bedrock passthrough
+
+```python
+from fastapi import FastAPI
+from gemini_calo.proxy import GeminiProxyService
+
+proxy = GeminiProxyService(api_keys=["gemini-key"])
+
+app = FastAPI()
+app.include_router(proxy.gemini_router)
+app.include_router(proxy.openai_router)
+app.include_router(proxy.bedrock_router)
+```
+
+Clients then call the proxy exactly like they would call `bedrock-runtime`:
+
+```bash
+# Using a Bedrock API key (AWS_BEARER_TOKEN_BEDROCK)
+curl -X POST http://localhost:8000/model/anthropic.claude-3-5-sonnet-20241022-v1:0/invoke \
+  -H "Content-Type: application/json" \
+  -H "X-AWS-Bearer-Token: $AWS_BEARER_TOKEN_BEDROCK" \
+  -d '{"anthropic_version":"bedrock-2023-05-31","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}'
+
+# Using IAM credentials (SigV4)
+curl -X POST http://localhost:8000/model/anthropic.claude-3-5-sonnet-20241022-v1:0/invoke \
+  -H "Content-Type: application/json" \
+  -H "X-AWS-Access-Key: $AWS_ACCESS_KEY_ID" \
+  -H "X-AWS-Secret-Key: $AWS_SECRET_ACCESS_KEY" \
+  -H "X-AWS-Region: us-east-1" \
+  -d '{"anthropic_version":"bedrock-2023-05-31","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}'
+```
+
+### Example: route specific Bedrock models to a fixed region with static SigV4 credentials
 
 ```python
 from fastapi import FastAPI
 from gemini_calo.proxy import GeminiProxyService, RouteConfig
 from gemini_calo.auth import AWSCredentials, create_aws_sigv4_provider
 
-app = FastAPI()
-
-# Define your AWS credentials
 bedrock_creds = AWSCredentials(
     access_key="AKIAIOSFODNN7EXAMPLE",
     secret_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
     region="us-east-1",
-    service="bedrock",
 )
 
 proxy = GeminiProxyService(
     base_url="https://generativelanguage.googleapis.com",
     api_keys=["gemini-key"],
     model_routes={
-        "bedrock-*": RouteConfig(
+        "anthropic.*": RouteConfig(
             url="https://bedrock-runtime.us-east-1.amazonaws.com",
-            api_keys=[],  # Not used for AWS auth
+            api_keys=[],
             auth=create_aws_sigv4_provider(bedrock_creds),
         ),
     },
 )
 
+app = FastAPI()
 app.include_router(proxy.gemini_router)
 app.include_router(proxy.openai_router)
+app.include_router(proxy.bedrock_router)
 ```
 
-### AWS Bedrock with Pass-Through Credentials
+### Example: per-client credentials with auto-detect (bearer or SigV4)
 
-When each client has their own AWS credentials, use pass-through authentication:
+Use `create_passthrough_bedrock_provider` when each client provides its own credentials and you want the proxy to accept either a Bedrock API key or IAM credentials without additional configuration:
 
 ```python
-from gemini_calo.auth import create_passthrough_aws_provider
+from fastapi import FastAPI
+from gemini_calo.proxy import GeminiProxyService, RouteConfig
+from gemini_calo.auth import create_passthrough_bedrock_provider
 
 proxy = GeminiProxyService(
     base_url="https://generativelanguage.googleapis.com",
     api_keys=["gemini-key"],
     model_routes={
-        "bedrock-*": RouteConfig(
-            url="https://bedrock-runtime.us-east-1.amazonaws.com",
+        "anthropic.*": RouteConfig(
+            url="https://bedrock-runtime.ap-southeast-3.amazonaws.com",
             api_keys=[],
-            auth=create_passthrough_aws_provider(
-                required=True,  # Raise error if credentials missing
-                default_region="us-east-1",
-                service="bedrock",
-            ),
+            auth=create_passthrough_bedrock_provider(),
         ),
     },
 )
 
-# Clients must send these headers:
-# X-AWS-Access-Key: AKIA...
-# X-AWS-Secret-Key: ...
-# X-AWS-Region: us-east-1 (optional)
-# X-AWS-Session-Token: ... (optional, for temporary credentials)
+app = FastAPI()
+app.include_router(proxy.bedrock_router)
 ```
+
+The provider checks headers in this order: `X-AWS-Bearer-Token` (bearer, no signing) → `X-AWS-Access-Key` + `X-AWS-Secret-Key` (SigV4) → no auth.
+
+## Advanced Authentication: Custom Auth Providers
+
+For providers that require more complex authentication, you can provide a custom auth provider function. This function receives the incoming request and returns an `httpx.Auth` instance.
 
 ### Custom Auth Provider Example
 
@@ -260,19 +314,48 @@ route = RouteConfig(
 )
 ```
 
-
-
 ## How the Middleware Works
 
-Middleware in FastAPI are functions that process every request before it reaches the specific path operation and every response before it is sent back to the client. Gemini Calo includes two useful middlewares by default.
+Middleware in FastAPI are functions that process every request before it reaches the specific path operation and every response before it is sent back to the client. Gemini Calo includes four built-in middlewares, applied in this order by the built-in server:
+
+```
+request → logging → auth → model_override → rollup → handler → upstream
+```
 
 ### Logging Middleware (`logging_middleware`)
 
-This middleware logs the details of every incoming request and outgoing response, including headers and body content. This is invaluable for debugging and monitoring. It's designed to handle both standard and streaming responses correctly.
+Logs every incoming request and outgoing response, including headers and body. Handles both standard and streaming responses. Controlled by `GEMINI_CALO_LOG_LEVEL` and `GEMINI_CALO_LOG_FILE`.
 
 ### Authentication Middleware (`auth_middleware`)
 
-This middleware protects your proxy endpoints. It checks for an API key in the `Authorization` header (as a Bearer token) or the `x-goog-api-key` header. It then validates this key against the list of keys you provided in the `GEMINI_CALO_PROXY_API_KEYS` environment variable. If the key is missing or invalid, it returns a `401 Unauthorized` error.
+Validates the proxy API key on all Gemini, OpenAI, and Bedrock requests. Accepts the key via `Authorization: Bearer <key>` or `x-goog-api-key` header. Returns `401` if the key is missing or invalid. Configured via `GEMINI_CALO_PROXY_API_KEYS`.
+
+### Model Override Middleware (`model_override_middleware`)
+
+Rewrites the model name before the request is forwarded upstream. Works on all three endpoint types:
+
+- **Gemini:** rewrites the model in the URL path (`/v1beta/models/{model}:generateContent`)
+- **OpenAI:** rewrites the `model` field in the JSON body
+- **Bedrock:** rewrites the model ID in the URL path (`/model/{modelId}/invoke`)
+
+Configured via `GEMINI_CALO_MODEL_OVERRIDE` or the `model_transformer` argument.
+
+### Rollup Middleware (`rollup_middleware`)
+
+Caches conversation history in an LRU cache and injects a summary as a system prompt once the conversation exceeds a size threshold, replacing the earlier messages. This keeps context windows manageable for long conversations without losing information.
+
+Supports all three request formats:
+
+| Format | Messages field | System prompt field |
+|--------|---------------|---------------------|
+| OpenAI | `messages[]` (excludes `role: system`) | `messages[0]` with `role: system` |
+| Gemini | `contents[]` | `system_instruction` |
+| Bedrock (Anthropic) | `messages[]` | `system` (string) |
+| Bedrock (Amazon Nova) | `messages[]` | `system` (array of `{"text": "..."}`) |
+
+The system prompt format for Bedrock is auto-detected from the `messages[].content` shape: array content → Nova-style array system; string content → Anthropic-style string system.
+
+Configured via `GEMINI_CALO_CONVERSATION_SUMMARIZATION_LRU_CACHE` and `GEMINI_CALO_CONVERSATION_SIZE_SUMMARIZATION_THRESHOLD`.
 
 ### Adding Your Own Middleware
 
@@ -464,7 +547,7 @@ python -m pytest tests/ --cov=gemini_calo --cov-report=html
 open htmlcov/index.html
 ```
 
-Current coverage: **76%**
+Current coverage: **80%**
 
 ### Optional Dependencies
 
@@ -482,6 +565,7 @@ Tests that require `botocore` are automatically skipped if it's not installed.
 |------|---------|
 | `test_auth.py` | Proxy authentication middleware tests |
 | `test_auth_providers.py` | Auth module tests (Bearer, XGoog, AWS SigV4) |
+| `test_bedrock.py` | Bedrock endpoint, auth providers, model override, and rollup tests |
 | `test_gzip_handling.py` | Gzip compression handling tests |
 | `test_logging.py` | Logging middleware tests |
 | `test_main.py` | Main proxy functionality tests |

@@ -1,9 +1,9 @@
 """Core auth provider types and protocols."""
 
-from typing import Literal, Callable, Awaitable, Union
-from fastapi import Request
-import httpx
+from typing import Awaitable, Callable, Literal, Union
 
+import httpx
+from fastapi import Request
 
 # Functional form: a callable that receives the incoming request
 # and returns an httpx.Auth for the outgoing request

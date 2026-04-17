@@ -1,7 +1,8 @@
 import inspect
 import json
-from typing import Any, Callable, Coroutine, Union
 from functools import partial
+from typing import Any, Callable, Coroutine, Union
+
 from fastapi import Request, Response
 
 from gemini_calo import config
@@ -48,6 +49,11 @@ async def model_override_middleware(
         REQUEST_TYPE.GEMINI_STREAMING_COMPLETION,
     ]:
         request = await _transform_model_in_gemini_request(request, transformer)
+    elif request_type in [
+        REQUEST_TYPE.BEDROCK_INVOKE,
+        REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+    ]:
+        request = await _transform_model_in_bedrock_request(request, transformer)
 
     return await call_next(request)
 
@@ -117,3 +123,25 @@ async def _transform_model_in_gemini_request(
         pass
     return request
 
+
+async def _transform_model_in_bedrock_request(
+    request: Request, transformer: ModelTransformerArg
+) -> Request:
+    """Transforms the model ID in a Bedrock request URL path."""
+    path = request.scope.get("path", "")
+    try:
+        # /model/{model_id}/invoke  or  /model/{model_id}/invoke-with-response-stream
+        parts = path.split("/model/", 1)
+        if len(parts) < 2:
+            return request
+        model_id, _, action = parts[1].rpartition("/")
+        if not model_id:
+            return request
+
+        new_model = await _resolve_new_model_name(transformer, model_id)
+
+        if new_model and new_model != model_id:
+            request.scope["path"] = f"/model/{new_model}/{action}"
+    except (IndexError, ValueError):
+        pass
+    return request

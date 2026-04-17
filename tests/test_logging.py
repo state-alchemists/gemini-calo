@@ -25,12 +25,15 @@ def client(mock_logger):
 
     @app.post("/regular")
     async def regular_endpoint():
-        return Response(content=json.dumps({"message": "hello"}), media_type="application/json")
+        return Response(
+            content=json.dumps({"message": "hello"}), media_type="application/json"
+        )
 
     @app.post("/streaming")
     async def streaming_endpoint():
         async def content():
             yield b'{"message": "hello"}'
+
         return StreamingResponse(content(), media_type="application/json")
 
     return TestClient(app)

@@ -33,6 +33,7 @@ def client(request):
 
 # --- Test Cases ---
 
+
 @pytest.mark.parametrize("client", [None], indirect=True)
 def test_no_override(client, httpx_mock):
     """
@@ -98,8 +99,10 @@ def test_env_var_override(monkeypatch, httpx_mock):
     Tests that the middleware correctly uses the environment variable for override.
     """
     monkeypatch.setenv("GEMINI_CALO_MODEL_OVERRIDE", "gemini-ultra")
-    from gemini_calo import config
     import importlib
+
+    from gemini_calo import config
+
     importlib.reload(config)
 
     client = TestClient(FastAPI())
@@ -127,6 +130,7 @@ def model_switcher(model: str):
         return "gemini-1.5-flash"
     return model
 
+
 @pytest.mark.parametrize("client", [model_switcher], indirect=True)
 def test_function_override(client, httpx_mock):
     """
@@ -151,6 +155,7 @@ async def async_model_switcher(model: str):
     if "pro" in model:
         return "gemini-1.5-flash"
     return model
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("client", [async_model_switcher], indirect=True)

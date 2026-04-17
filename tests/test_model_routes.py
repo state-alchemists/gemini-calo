@@ -1,4 +1,5 @@
 """Tests for model_routes routing, RouteConfig, and related helpers."""
+
 import json
 
 import pytest
@@ -16,6 +17,7 @@ ALT_BASE_URL = "https://openai.example.com"
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_gemini_request(path: str) -> Request:
     scope = {
         "type": "http",
@@ -32,7 +34,11 @@ def _make_gemini_request(path: str) -> Request:
 
 
 def _make_openai_request(model: str | None = "gpt-4o") -> Request:
-    body = json.dumps({"model": model, "messages": []}).encode() if model is not None else b"{}"
+    body = (
+        json.dumps({"model": model, "messages": []}).encode()
+        if model is not None
+        else b"{}"
+    )
     scope = {
         "type": "http",
         "method": "POST",
@@ -66,6 +72,7 @@ def _make_test_client(proxy: GeminiProxyService) -> TestClient:
 # RouteConfig round-robin
 # ---------------------------------------------------------------------------
 
+
 def test_route_config_round_robin_cycles_through_keys():
     route = RouteConfig(url="https://example.com", api_keys=["key-a", "key-b", "key-c"])
     assert route.get_api_key() == "key-a"
@@ -84,6 +91,7 @@ def test_route_config_single_key_always_returns_same():
 # _extract_model_name — Gemini paths
 # ---------------------------------------------------------------------------
 
+
 async def test_extract_model_name_gemini_generate_content():
     proxy = _make_proxy_with_routes()
     request = _make_gemini_request("/v1beta/models/gemini-1.5-flash:generateContent")
@@ -92,7 +100,9 @@ async def test_extract_model_name_gemini_generate_content():
 
 async def test_extract_model_name_gemini_stream_generate_content():
     proxy = _make_proxy_with_routes()
-    request = _make_gemini_request("/v1beta/models/gemini-2.0-pro:streamGenerateContent")
+    request = _make_gemini_request(
+        "/v1beta/models/gemini-2.0-pro:streamGenerateContent"
+    )
     assert await proxy._extract_model_name(request) == "gemini-2.0-pro"
 
 
@@ -105,13 +115,19 @@ async def test_extract_model_name_gemini_embed_content():
 async def test_extract_model_name_gemini_with_slash_in_model():
     """Model names that include a slash (path param uses :path converter)."""
     proxy = _make_proxy_with_routes()
-    request = _make_gemini_request("/v1beta/models/publishers/google/models/gemini-pro:generateContent")
-    assert await proxy._extract_model_name(request) == "publishers/google/models/gemini-pro"
+    request = _make_gemini_request(
+        "/v1beta/models/publishers/google/models/gemini-pro:generateContent"
+    )
+    assert (
+        await proxy._extract_model_name(request)
+        == "publishers/google/models/gemini-pro"
+    )
 
 
 # ---------------------------------------------------------------------------
 # _extract_model_name — OpenAI body
 # ---------------------------------------------------------------------------
+
 
 async def test_extract_model_name_openai_from_body():
     proxy = _make_proxy_with_routes()
@@ -142,6 +158,7 @@ async def test_extract_model_name_other_endpoint_returns_none():
 # ---------------------------------------------------------------------------
 # _find_route — glob matching
 # ---------------------------------------------------------------------------
+
 
 def test_find_route_exact_match():
     route = RouteConfig(url="https://example.com", api_keys=["k"])
@@ -180,6 +197,7 @@ def test_find_route_none_model_returns_none():
 # ---------------------------------------------------------------------------
 # Integration: request goes to the correct upstream URL
 # ---------------------------------------------------------------------------
+
 
 def test_gemini_request_routed_to_custom_url(httpx_mock):
     route = RouteConfig(url=ALT_BASE_URL, api_keys=["alt-key"], auth_type="bearer")
@@ -248,6 +266,7 @@ def test_unmatched_model_falls_back_to_base_url(httpx_mock):
 # Integration: auth headers
 # ---------------------------------------------------------------------------
 
+
 def test_route_bearer_auth_sends_authorization_header(httpx_mock):
     route = RouteConfig(
         url=ALT_BASE_URL,
@@ -302,6 +321,7 @@ def test_route_goog_auth_sends_x_goog_api_key_header(httpx_mock):
 # Integration: round-robin across RouteConfig api_keys
 # ---------------------------------------------------------------------------
 
+
 def test_route_round_robin_across_requests(httpx_mock):
     route = RouteConfig(
         url=ALT_BASE_URL,
@@ -318,8 +338,12 @@ def test_route_round_robin_across_requests(httpx_mock):
             status_code=200,
         )
 
-    client.post("/v1beta/openai/chat/completions", json={"model": "gpt-4o", "messages": []})
-    client.post("/v1beta/openai/chat/completions", json={"model": "gpt-4o", "messages": []})
+    client.post(
+        "/v1beta/openai/chat/completions", json={"model": "gpt-4o", "messages": []}
+    )
+    client.post(
+        "/v1beta/openai/chat/completions", json={"model": "gpt-4o", "messages": []}
+    )
 
     requests = httpx_mock.get_requests()
     assert requests[0].headers["authorization"] == "Bearer key-1"

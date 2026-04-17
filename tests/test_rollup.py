@@ -1,4 +1,3 @@
-
 import json
 from functools import partial
 
@@ -36,7 +35,9 @@ def test_non_completion_request(client, httpx_mock):
     """
     Tests that a request that is not a completion request is not affected.
     """
-    httpx_mock.add_response(url=f"{BASE_URL}/v1beta/models", status_code=200, json={"models": []})
+    httpx_mock.add_response(
+        url=f"{BASE_URL}/v1beta/models", status_code=200, json={"models": []}
+    )
     response = client.get("/v1beta/models")
     assert response.status_code == 200
     assert len(httpx_mock.get_requests()) == 1
@@ -44,7 +45,9 @@ def test_non_completion_request(client, httpx_mock):
 
 def test_gemini_completion_not_in_cache(client, httpx_mock):
     client, _ = client
-    mock_response_content = json.dumps({"candidates": [{"content": {"role": "model", "parts": [{"text": "World"}]}}]})
+    mock_response_content = json.dumps(
+        {"candidates": [{"content": {"role": "model", "parts": [{"text": "World"}]}}]}
+    )
     httpx_mock.add_response(
         url=f"{BASE_URL}/v1beta/models/gemini-pro:generateContent",
         content=mock_response_content,
@@ -63,7 +66,13 @@ def test_gemini_completion_not_in_cache(client, httpx_mock):
 
 def test_gemini_completion_in_cache(client, httpx_mock):
     client, cache = client
-    mock_response_content_1 = json.dumps({"candidates": [{"content": {"role": "model", "parts": [{"text": "I am doing well."}]}}]})
+    mock_response_content_1 = json.dumps(
+        {
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"text": "I am doing well."}]}}
+            ]
+        }
+    )
     httpx_mock.add_response(
         url=f"{BASE_URL}/v1beta/models/gemini-pro:generateContent",
         content=mock_response_content_1,
@@ -76,7 +85,13 @@ def test_gemini_completion_in_cache(client, httpx_mock):
         json={"contents": [{"role": "user", "parts": [{"text": "Hello"}]}]},
     )
 
-    mock_response_content_2 = json.dumps({"candidates": [{"content": {"parts": [{"text": "I am a large language model."}]}}]})
+    mock_response_content_2 = json.dumps(
+        {
+            "candidates": [
+                {"content": {"parts": [{"text": "I am a large language model."}]}}
+            ]
+        }
+    )
     httpx_mock.add_response(
         url=f"{BASE_URL}/v1beta/models/gemini-pro:generateContent",
         content=mock_response_content_2,
@@ -86,7 +101,13 @@ def test_gemini_completion_in_cache(client, httpx_mock):
     # Second request with the same history plus a new message
     response = client.post(
         "/v1beta/models/gemini-pro:generateContent",
-        json={"contents": [{"role": "user", "parts": [{"text": "Hello"}]}, {"role": "model", "parts": [{"text": "I am doing well."}]}, {"role": "user", "parts": [{"text": "How are you?"}]}]},
+        json={
+            "contents": [
+                {"role": "user", "parts": [{"text": "Hello"}]},
+                {"role": "model", "parts": [{"text": "I am doing well."}]},
+                {"role": "user", "parts": [{"text": "How are you?"}]},
+            ]
+        },
     )
 
     assert response.status_code == 200
@@ -99,7 +120,9 @@ def test_gemini_completion_in_cache(client, httpx_mock):
 
 def test_openai_completion_not_in_cache(client, httpx_mock):
     client, _ = client
-    mock_response_content = json.dumps({"choices": [{"message": {"role": "assistant", "content": "World"}}]})
+    mock_response_content = json.dumps(
+        {"choices": [{"message": {"role": "assistant", "content": "World"}}]}
+    )
     httpx_mock.add_response(
         url=f"{BASE_URL}/v1beta/openai/chat/completions",
         content=mock_response_content,
@@ -118,7 +141,9 @@ def test_openai_completion_not_in_cache(client, httpx_mock):
 
 def test_openai_completion_in_cache(client, httpx_mock):
     client, cache = client
-    mock_response_content_1 = json.dumps({"choices": [{"message": {"role": "assistant", "content": "I am doing well."}}]})
+    mock_response_content_1 = json.dumps(
+        {"choices": [{"message": {"role": "assistant", "content": "I am doing well."}}]}
+    )
     httpx_mock.add_response(
         url=f"{BASE_URL}/v1beta/openai/chat/completions",
         content=mock_response_content_1,
@@ -131,7 +156,18 @@ def test_openai_completion_in_cache(client, httpx_mock):
         json={"messages": [{"role": "user", "content": "Hello"}]},
     )
 
-    mock_response_content_2 = json.dumps({"choices": [{"message": {"role": "assistant", "content": "I am a large language model."}}]})
+    mock_response_content_2 = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "I am a large language model.",
+                    }
+                }
+            ]
+        }
+    )
     httpx_mock.add_response(
         url=f"{BASE_URL}/v1beta/openai/chat/completions",
         content=mock_response_content_2,
@@ -141,7 +177,13 @@ def test_openai_completion_in_cache(client, httpx_mock):
     # Second request with the same history plus a new message
     response = client.post(
         "/v1beta/openai/chat/completions",
-        json={"messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "I am doing well."}, {"role": "user", "content": "How are you?"}]},
+        json={
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "I am doing well."},
+                {"role": "user", "content": "How are you?"},
+            ]
+        },
     )
 
     assert response.status_code == 200

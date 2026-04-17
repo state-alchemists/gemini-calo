@@ -1,6 +1,6 @@
 import logging
-from gemini_calo.config import LOG_LEVEL, LOG_FILE
 
+from gemini_calo.config import LOG_FILE, LOG_LEVEL
 
 logging.basicConfig(
     level=LOG_LEVEL,

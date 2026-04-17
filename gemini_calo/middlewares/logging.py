@@ -56,12 +56,12 @@ async def logging_middleware(request: Request, call_next, logger: Logger | None)
             async for chunk in original_iterator:
                 full_body += chunk
                 yield chunk
-            
+
             # Add gzip detection and decompression before JSON parsing
-            content_encoding = response.headers.get('content-encoding')
+            content_encoding = response.headers.get("content-encoding")
             if content_encoding:
                 full_body = decompress_content(full_body, content_encoding)
-            
+
             try:
                 logger.info(f"Response body (stream): {json.loads(full_body)}")
             except json.JSONDecodeError:
@@ -96,10 +96,10 @@ async def logging_middleware(request: Request, call_next, logger: Logger | None)
 
     if response_body:
         # Option 2: Add gzip detection and decompression before JSON parsing
-        content_encoding = response.headers.get('content-encoding')
+        content_encoding = response.headers.get("content-encoding")
         if content_encoding:
             response_body = decompress_content(response_body, content_encoding)
-        
+
         try:
             logger.info(f"Response body: {json.loads(response_body)}")
         except json.JSONDecodeError:

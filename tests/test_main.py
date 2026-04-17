@@ -137,7 +137,7 @@ def test_openai_function_calling(client, httpx_mock):
                                 "type": "function",
                                 "function": {
                                     "name": "find_weather",
-                                    "arguments": '{\n  "location": "Boston"\n}'
+                                    "arguments": '{\n  "location": "Boston"\n}',
                                 },
                             }
                         ]
@@ -167,7 +167,7 @@ def test_openai_function_calling(client, httpx_mock):
 
 
 def test_openai_chat_completions_streaming(client, httpx_mock):
-    mock_response_content = b"data: {\"choices\": [{\"delta\": {\"content\": \"Hello\"}}]}\n\ndata: {\"choices\": [{\"delta\": {\"content\": \" world\"}}]}\n\ndata: [DONE]\n\n"
+    mock_response_content = b'data: {"choices": [{"delta": {"content": "Hello"}}]}\n\ndata: {"choices": [{"delta": {"content": " world"}}]}\n\ndata: [DONE]\n\n'
 
     httpx_mock.add_response(
         url=f"{BASE_URL}/v1beta/openai/chat/completions",
@@ -189,6 +189,7 @@ def test_openai_chat_completions_streaming(client, httpx_mock):
     streaming_content = response.iter_bytes()
     chunks = [chunk for chunk in streaming_content]
     assert b"".join(chunks) == mock_response_content
+
 
 def test_openai_to_gemini_conversion(client, httpx_mock):
     mock_response_content = json.dumps({"candidates": [{"finishReason": "STOP"}]})

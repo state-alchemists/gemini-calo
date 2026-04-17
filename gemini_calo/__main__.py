@@ -2,13 +2,14 @@ import uvicorn
 from fastapi import FastAPI
 
 from gemini_calo.config import (
-    GEMINI_API_KEYS, MODEL_OVERRIDE, PROXY_API_KEYS, HTTP_PORT
+    GEMINI_API_KEYS,
+    HTTP_PORT,
+    MODEL_OVERRIDE,
+    PROXY_API_KEYS,
 )
 from gemini_calo.middlewares.auth import create_auth_middleware
 from gemini_calo.middlewares.logging import create_logging_middleware
-from gemini_calo.middlewares.model_override import (
-    create_model_override_middleware
-)
+from gemini_calo.middlewares.model_override import create_model_override_middleware
 from gemini_calo.middlewares.rollup import create_rollup_middleware
 from gemini_calo.proxy import GeminiProxyService
 
@@ -26,6 +27,7 @@ def start_server():
     app.middleware("http")(create_rollup_middleware(proxy))
     app.include_router(proxy.gemini_router)
     app.include_router(proxy.openai_router)
+    app.include_router(proxy.bedrock_router)
 
     @app.get("/")
     def read_root():
