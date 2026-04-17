@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "gemini-calo"
-version = "0.2.1"
+version = "0.2.2"
 description = "A Fastapi Based Proxy for Gemini API"
 authors = ["Go Frendi Gunawan <gofrendiasgard@gmail.com>"]
 license = "AGPL-3.0-or-later"
@@ -11,9 +11,9 @@ documentation = "https://github.com/state-alchemists/gemini-calo"
 
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0.0"
-fastapi = "^0.116.1"
-uvicorn = "^0.35.0"
-cachetools = "^6.1.0"
+fastapi = ">=0.116.1"
+uvicorn = ">=0.35.0"
+cachetools = ">=6.1.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "~8.3.5"
