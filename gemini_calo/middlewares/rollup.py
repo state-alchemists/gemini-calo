@@ -155,9 +155,14 @@ async def rollup_middleware(
     if content_encoding:
         response_body = decompress_content(response_body, content_encoding)
 
+    # Bedrock streaming responses use binary AWS Event Stream format, not JSON
+    is_binary_streaming = request_type in (
+        REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+        REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
+    )
     try:
-        response_json = json.loads(response_body)
-    except json.JSONDecodeError:
+        response_json = {} if is_binary_streaming else json.loads(response_body)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         response_json = {}
 
     # Handle case where response_json might be a list (from streaming responses)
