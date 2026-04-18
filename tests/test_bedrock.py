@@ -74,6 +74,34 @@ def test_get_request_type_bedrock_streaming():
     assert r.json()["type"] == REQUEST_TYPE.BEDROCK_STREAMING_INVOKE.value
 
 
+def test_get_request_type_bedrock_converse():
+    from starlette.testclient import TestClient as SC
+
+    app = FastAPI()
+
+    @app.post("/model/{model_id:path}/converse")
+    async def dummy(request: Request):
+        return {"type": GeminiProxyService.get_request_type(request).value}
+
+    client = SC(app)
+    r = client.post(f"/model/{MODEL_ID}/converse", json={})
+    assert r.json()["type"] == REQUEST_TYPE.BEDROCK_CONVERSE.value
+
+
+def test_get_request_type_bedrock_converse_stream():
+    from starlette.testclient import TestClient as SC
+
+    app = FastAPI()
+
+    @app.post("/model/{model_id:path}/converse-stream")
+    async def dummy(request: Request):
+        return {"type": GeminiProxyService.get_request_type(request).value}
+
+    client = SC(app)
+    r = client.post(f"/model/{MODEL_ID}/converse-stream", json={})
+    assert r.json()["type"] == REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE.value
+
+
 def test_get_request_type_non_bedrock_not_misdetected():
     from starlette.testclient import TestClient as SC
 
@@ -171,6 +199,165 @@ def test_bedrock_streaming_invoke(httpx_mock):
     assert b"".join(response.iter_bytes()) == mock_chunks
 
 
+def test_bedrock_converse_request(httpx_mock):
+    app, _ = _make_app()
+    client = TestClient(app)
+
+    mock_body = json.dumps(
+        {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": "Hello from Converse!"}],
+                }
+            },
+            "stopReason": "end_turn",
+        }
+    )
+    httpx_mock.add_response(
+        url=f"{BEDROCK_BASE}/model/{MODEL_ID}/converse",
+        content=mock_body,
+        status_code=200,
+    )
+
+    response = client.post(
+        f"/model/{MODEL_ID}/converse",
+        json={"messages": [{"role": "user", "content": [{"text": "Hello"}]}]},
+        headers={"X-AWS-Bearer-Token": "my-bedrock-api-key"},
+    )
+
+    assert response.status_code == 200
+    sent = httpx_mock.get_requests()[0]
+    assert sent.headers["authorization"] == "Bearer my-bedrock-api-key"
+
+
+def test_bedrock_converse_stream_request(httpx_mock):
+    app, _ = _make_app()
+    client = TestClient(app)
+
+    mock_chunks = b'{"contentBlockDelta": {"delta": {"text": "Hi"}}}'
+    httpx_mock.add_response(
+        url=f"{BEDROCK_BASE}/model/{MODEL_ID}/converse-stream",
+        content=mock_chunks,
+        status_code=200,
+    )
+
+    response = client.post(
+        f"/model/{MODEL_ID}/converse-stream",
+        json={"messages": [{"role": "user", "content": [{"text": "Hi"}]}]},
+        headers={"X-AWS-Bearer-Token": "my-bedrock-api-key"},
+    )
+
+    assert response.status_code == 200
+    assert b"".join(response.iter_bytes()) == mock_chunks
+
+
+def test_bedrock_invoke_forwards_optional_headers(httpx_mock):
+    app, _ = _make_app()
+    client = TestClient(app)
+
+    httpx_mock.add_response(
+        url=f"{BEDROCK_BASE}/model/{MODEL_ID}/invoke",
+        content=json.dumps({"content": [{"type": "text", "text": "Hi"}]}),
+        status_code=200,
+    )
+
+    client.post(
+        f"/model/{MODEL_ID}/invoke",
+        json={"messages": [{"role": "user", "content": "Hi"}]},
+        headers={
+            "X-AWS-Bearer-Token": "tok",
+            "X-Amzn-Bedrock-Trace": "ENABLED",
+            "X-Amzn-Bedrock-GuardrailIdentifier": "my-guardrail",
+            "X-Amzn-Bedrock-GuardrailVersion": "1",
+            "X-Amzn-Bedrock-PerformanceConfig-Latency": "optimized",
+            "X-Amzn-Bedrock-Service-Tier": "priority",
+            "Accept": "application/json",
+        },
+    )
+
+    sent = httpx_mock.get_requests()[0]
+    assert sent.headers.get("x-amzn-bedrock-trace") == "ENABLED"
+    assert sent.headers.get("x-amzn-bedrock-guardrailidentifier") == "my-guardrail"
+    assert sent.headers.get("x-amzn-bedrock-guardrailversion") == "1"
+    assert sent.headers.get("x-amzn-bedrock-performanceconfig-latency") == "optimized"
+    assert sent.headers.get("x-amzn-bedrock-service-tier") == "priority"
+    assert sent.headers.get("accept") == "application/json"
+
+
+def test_bedrock_invoke_does_not_forward_absent_optional_headers(httpx_mock):
+    app, _ = _make_app()
+    client = TestClient(app)
+
+    httpx_mock.add_response(
+        url=f"{BEDROCK_BASE}/model/{MODEL_ID}/invoke",
+        content=json.dumps({"content": [{"type": "text", "text": "Hi"}]}),
+        status_code=200,
+    )
+
+    client.post(
+        f"/model/{MODEL_ID}/invoke",
+        json={"messages": [{"role": "user", "content": "Hi"}]},
+        headers={"X-AWS-Bearer-Token": "tok"},
+    )
+
+    sent = httpx_mock.get_requests()[0]
+    assert "x-amzn-bedrock-trace" not in sent.headers
+    assert "x-amzn-bedrock-guardrailidentifier" not in sent.headers
+
+
+def test_bedrock_converse_forwards_optional_headers(httpx_mock):
+    app, _ = _make_app()
+    client = TestClient(app)
+
+    httpx_mock.add_response(
+        url=f"{BEDROCK_BASE}/model/{MODEL_ID}/converse",
+        content=json.dumps(
+            {"output": {"message": {"role": "assistant", "content": []}}}
+        ),
+        status_code=200,
+    )
+
+    client.post(
+        f"/model/{MODEL_ID}/converse",
+        json={"messages": [{"role": "user", "content": [{"text": "Hi"}]}]},
+        headers={
+            "X-AWS-Bearer-Token": "tok",
+            "X-Amzn-Bedrock-Trace": "ENABLED_FULL",
+        },
+    )
+
+    sent = httpx_mock.get_requests()[0]
+    assert sent.headers.get("x-amzn-bedrock-trace") == "ENABLED_FULL"
+
+
+def test_bedrock_converse_preserves_content_type(httpx_mock):
+    app, _ = _make_app()
+    client = TestClient(app)
+
+    httpx_mock.add_response(
+        url=f"{BEDROCK_BASE}/model/{MODEL_ID}/converse",
+        content=json.dumps(
+            {"output": {"message": {"role": "assistant", "content": []}}}
+        ),
+        status_code=200,
+    )
+
+    client.post(
+        f"/model/{MODEL_ID}/converse",
+        content=json.dumps(
+            {"messages": [{"role": "user", "content": [{"text": "Hi"}]}]}
+        ),
+        headers={
+            "X-AWS-Bearer-Token": "tok",
+            "Content-Type": "application/x-amz-json-1.1",
+        },
+    )
+
+    sent = httpx_mock.get_requests()[0]
+    assert sent.headers["content-type"] == "application/x-amz-json-1.1"
+
+
 # ---------------------------------------------------------------------------
 # create_passthrough_bedrock_provider
 # ---------------------------------------------------------------------------
@@ -249,6 +436,52 @@ def bedrock_override_client(request):
         )
     app.include_router(proxy.bedrock_router)
     return TestClient(app)
+
+
+@pytest.mark.parametrize(
+    "bedrock_override_client", ["anthropic.claude-3-haiku-20240307-v1:0"], indirect=True
+)
+def test_model_override_bedrock_converse(bedrock_override_client, httpx_mock):
+    new_model = "anthropic.claude-3-haiku-20240307-v1:0"
+    httpx_mock.add_response(
+        url=f"{BEDROCK_BASE}/model/{new_model}/converse",
+        content=json.dumps(
+            {"output": {"message": {"role": "assistant", "content": [{"text": "Hi"}]}}}
+        ),
+        status_code=200,
+    )
+
+    response = bedrock_override_client.post(
+        f"/model/{MODEL_ID}/converse",
+        json={"messages": [{"role": "user", "content": [{"text": "Hi"}]}]},
+        headers={"X-AWS-Bearer-Token": "tok"},
+    )
+
+    assert response.status_code == 200
+    assert httpx_mock.get_requests()[0].url.path == f"/model/{new_model}/converse"
+
+
+@pytest.mark.parametrize(
+    "bedrock_override_client", ["anthropic.claude-3-haiku-20240307-v1:0"], indirect=True
+)
+def test_model_override_bedrock_converse_stream(bedrock_override_client, httpx_mock):
+    new_model = "anthropic.claude-3-haiku-20240307-v1:0"
+    httpx_mock.add_response(
+        url=f"{BEDROCK_BASE}/model/{new_model}/converse-stream",
+        content=b"chunk",
+        status_code=200,
+    )
+
+    response = bedrock_override_client.post(
+        f"/model/{MODEL_ID}/converse-stream",
+        json={"messages": [{"role": "user", "content": [{"text": "Hi"}]}]},
+        headers={"X-AWS-Bearer-Token": "tok"},
+    )
+
+    assert response.status_code == 200
+    assert (
+        httpx_mock.get_requests()[0].url.path == f"/model/{new_model}/converse-stream"
+    )
 
 
 @pytest.mark.parametrize(
@@ -457,4 +690,102 @@ def test_bedrock_rollup_injects_cached_context(bedrock_rollup_client, httpx_mock
     assert "system" in sent_body
     assert isinstance(sent_body["system"], list)
     # matched messages dropped
+    assert len(sent_body["messages"]) < 3
+
+
+# ---------------------------------------------------------------------------
+# Bedrock Converse API — rollup middleware
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_converse_rollup_caches_response(bedrock_rollup_client, httpx_mock):
+    client, cache = bedrock_rollup_client
+    mock_response = json.dumps(
+        {
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": "I am Claude via Converse."}],
+                }
+            },
+            "stopReason": "end_turn",
+        }
+    )
+    httpx_mock.add_response(
+        url=f"{BEDROCK_BASE}/model/{MODEL_ID}/converse",
+        content=mock_response,
+        status_code=200,
+    )
+
+    client.post(
+        f"/model/{MODEL_ID}/converse",
+        json={
+            "messages": [{"role": "user", "content": [{"text": "Who are you?"}]}],
+        },
+        headers={"X-AWS-Bearer-Token": "tok"},
+    )
+
+    assert len(cache) == 1
+
+
+def test_bedrock_converse_rollup_injects_cached_context(
+    bedrock_rollup_client, httpx_mock
+):
+    client, cache = bedrock_rollup_client
+
+    # Turn 1: populate cache via converse endpoint
+    httpx_mock.add_response(
+        url=f"{BEDROCK_BASE}/model/{MODEL_ID}/converse",
+        content=json.dumps(
+            {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"text": "I am the Converse bot."}],
+                    }
+                },
+                "stopReason": "end_turn",
+            }
+        ),
+        status_code=200,
+    )
+    client.post(
+        f"/model/{MODEL_ID}/converse",
+        json={"messages": [{"role": "user", "content": [{"text": "Who are you?"}]}]},
+        headers={"X-AWS-Bearer-Token": "tok"},
+    )
+
+    assert len(cache) == 1
+
+    # Turn 2: send full history — rollup injects system prompt and trims old messages
+    httpx_mock.add_response(
+        url=f"{BEDROCK_BASE}/model/{MODEL_ID}/converse",
+        content=json.dumps(
+            {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"text": "Nice to meet you too."}],
+                    }
+                },
+            }
+        ),
+        status_code=200,
+    )
+    client.post(
+        f"/model/{MODEL_ID}/converse",
+        json={
+            "messages": [
+                {"role": "user", "content": [{"text": "Who are you?"}]},
+                {"role": "assistant", "content": [{"text": "I am the Converse bot."}]},
+                {"role": "user", "content": [{"text": "Nice!"}]},
+            ]
+        },
+        headers={"X-AWS-Bearer-Token": "tok"},
+    )
+
+    second_req = httpx_mock.get_requests()[1]
+    sent_body = json.loads(second_req.content)
+    assert "system" in sent_body
+    assert isinstance(sent_body["system"], list)
     assert len(sent_body["messages"]) < 3

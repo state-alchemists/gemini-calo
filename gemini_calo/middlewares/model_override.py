@@ -52,6 +52,8 @@ async def model_override_middleware(
     elif request_type in [
         REQUEST_TYPE.BEDROCK_INVOKE,
         REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+        REQUEST_TYPE.BEDROCK_CONVERSE,
+        REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
     ]:
         request = await _transform_model_in_bedrock_request(request, transformer)
 

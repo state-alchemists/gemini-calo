@@ -2,14 +2,14 @@
 
 **Gemini Calo** is a powerful, yet simple, FastAPI-based proxy server for Google's Gemini API. It provides a seamless way to add a layer of authentication, logging, and monitoring to your Gemini API requests. It's designed to be run as a standalone server or integrated into your existing FastAPI applications.
 
-One of its key features is providing an OpenAI-compatible endpoint, allowing you to use Gemini models with tools and libraries that are built for the OpenAI API. It also exposes a native **AWS Bedrock-compatible endpoint** (`/model/{modelId}/invoke`), so any client that targets `bedrock-runtime` works without changes.
+One of its key features is providing an OpenAI-compatible endpoint, allowing you to use Gemini models with tools and libraries that are built for the OpenAI API. It also exposes native **AWS Bedrock-compatible endpoints** (InvokeModel and Converse APIs), so any client that targets `bedrock-runtime` works without changes.
 
 ## Key Features
 
 *   **Authentication:** Secure your Gemini API access with an additional layer of API key authentication.
 *   **Request Logging:** Detailed logging of all incoming requests and outgoing responses.
 *   **OpenAI Compatibility:** Use Gemini models through an OpenAI-compatible `/v1/chat/completions` endpoint.
-*   **AWS Bedrock Compatibility:** Native Bedrock endpoint (`/model/{modelId}/invoke` and `/model/{modelId}/invoke-with-response-stream`) — supports both Bedrock API key (bearer token) and SigV4 signing.
+*   **AWS Bedrock Compatibility:** Native Bedrock endpoints covering both the InvokeModel API (`/model/{modelId}/invoke`, `/model/{modelId}/invoke-with-response-stream`) and the Converse API (`/model/{modelId}/converse`, `/model/{modelId}/converse-stream`) — supports both Bedrock API key (bearer token) and SigV4 signing.
 *   **Round-Robin API Keys:** Distribute your requests across multiple API keys, both globally and per model route.
 *   **Multi-Provider Routing:** Route specific models (via glob patterns) to different upstream providers — use OpenAI, Anthropic, AWS Bedrock, or any OpenAI-compatible endpoint alongside Gemini.
 *   **Extensible Authentication:** Support for complex auth schemes like AWS SigV4, OAuth, or custom providers via pluggable auth modules.
@@ -180,10 +180,34 @@ Gemini Calo exposes a native Bedrock-compatible endpoint. Any client targeting `
 
 ### Supported routes
 
+#### InvokeModel API
+
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/model/{modelId}/invoke` | Synchronous invocation |
 | `POST` | `/model/{modelId}/invoke-with-response-stream` | Streaming invocation |
+
+#### Converse API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/model/{modelId}/converse` | Synchronous Converse invocation |
+| `POST` | `/model/{modelId}/converse-stream` | Streaming Converse invocation |
+
+The Converse API routes support the same authentication options as the InvokeModel routes. The proxy preserves the incoming `Content-Type` header and forwards the following optional Bedrock-specific request headers when present:
+
+| Header | Purpose |
+|--------|---------|
+| `Accept` | Desired MIME type for the response body |
+| `X-Amzn-Bedrock-Trace` | Enable tracing (`ENABLED` / `DISABLED` / `ENABLED_FULL`) |
+| `X-Amzn-Bedrock-GuardrailIdentifier` | ID of a guardrail to apply (InvokeModel only) |
+| `X-Amzn-Bedrock-GuardrailVersion` | Guardrail version (InvokeModel only) |
+| `X-Amzn-Bedrock-PerformanceConfig-Latency` | `standard` or `optimized` (InvokeModel only) |
+| `X-Amzn-Bedrock-Service-Tier` | `priority` / `default` / `flex` / `reserved` (InvokeModel only) |
+
+For the Converse API, guardrail config, inference config, and service tier are passed in the **JSON body** (not as headers) and are forwarded via normal body passthrough.
+
+> **Streaming note:** `converse-stream` returns a binary AWS Event Stream (`application/vnd.amazon.eventstream`), the same binary framing as `invoke-with-response-stream`. The proxy streams the raw bytes through intact, so any boto3 or SDK client that reads the event stream will work correctly.
 
 ### Authentication options
 
@@ -215,13 +239,19 @@ app.include_router(proxy.bedrock_router)
 Clients then call the proxy exactly like they would call `bedrock-runtime`:
 
 ```bash
-# Using a Bedrock API key (AWS_BEARER_TOKEN_BEDROCK)
+# InvokeModel — using a Bedrock API key (AWS_BEARER_TOKEN_BEDROCK)
 curl -X POST http://localhost:8000/model/anthropic.claude-3-5-sonnet-20241022-v1:0/invoke \
   -H "Content-Type: application/json" \
   -H "X-AWS-Bearer-Token: $AWS_BEARER_TOKEN_BEDROCK" \
   -d '{"anthropic_version":"bedrock-2023-05-31","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}'
 
-# Using IAM credentials (SigV4)
+# Converse API — using a Bedrock API key
+curl -X POST http://localhost:8000/model/anthropic.claude-3-5-sonnet-20241022-v1:0/converse \
+  -H "Content-Type: application/x-amz-json-1.1" \
+  -H "X-AWS-Bearer-Token: $AWS_BEARER_TOKEN_BEDROCK" \
+  -d '{"messages":[{"role":"user","content":[{"text":"Hello"}]}]}'
+
+# InvokeModel — using IAM credentials (SigV4)
 curl -X POST http://localhost:8000/model/anthropic.claude-3-5-sonnet-20241022-v1:0/invoke \
   -H "Content-Type: application/json" \
   -H "X-AWS-Access-Key: $AWS_ACCESS_KEY_ID" \
@@ -336,7 +366,7 @@ Rewrites the model name before the request is forwarded upstream. Works on all t
 
 - **Gemini:** rewrites the model in the URL path (`/v1beta/models/{model}:generateContent`)
 - **OpenAI:** rewrites the `model` field in the JSON body
-- **Bedrock:** rewrites the model ID in the URL path (`/model/{modelId}/invoke`)
+- **Bedrock (InvokeModel & Converse):** rewrites the model ID in the URL path (`/model/{modelId}/invoke`, `/model/{modelId}/converse`, etc.)
 
 Configured via `GEMINI_CALO_MODEL_OVERRIDE` or the `model_transformer` argument.
 
@@ -350,10 +380,10 @@ Supports all three request formats:
 |--------|---------------|---------------------|
 | OpenAI | `messages[]` (excludes `role: system`) | `messages[0]` with `role: system` |
 | Gemini | `contents[]` | `system_instruction` |
-| Bedrock (Anthropic) | `messages[]` | `system` (string) |
-| Bedrock (Amazon Nova) | `messages[]` | `system` (array of `{"text": "..."}`) |
+| Bedrock — Anthropic InvokeModel | `messages[]` | `system` (string) |
+| Bedrock — Amazon Nova / Converse API | `messages[]` | `system` (array of `{"text": "..."}`) |
 
-The system prompt format for Bedrock is auto-detected from the `messages[].content` shape: array content → Nova-style array system; string content → Anthropic-style string system.
+The system prompt format for Bedrock is auto-detected from the `messages[].content` shape: array content → Nova/Converse-style array system; string content → Anthropic-style string system. This applies uniformly to InvokeModel (`/invoke`) and Converse API (`/converse`, `/converse-stream`) routes.
 
 Configured via `GEMINI_CALO_CONVERSATION_SUMMARIZATION_LRU_CACHE` and `GEMINI_CALO_CONVERSATION_SIZE_SUMMARIZATION_THRESHOLD`.
 
@@ -547,7 +577,7 @@ python -m pytest tests/ --cov=gemini_calo --cov-report=html
 open htmlcov/index.html
 ```
 
-Current coverage: **80%**
+Current coverage: **~82%**
 
 ### Optional Dependencies
 

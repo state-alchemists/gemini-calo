@@ -51,6 +51,8 @@ async def rollup_middleware(
         REQUEST_TYPE.GEMINI_STREAMING_COMPLETION,
         REQUEST_TYPE.BEDROCK_INVOKE,
         REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+        REQUEST_TYPE.BEDROCK_CONVERSE,
+        REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
     ]
 
     if not is_completion:
@@ -68,6 +70,8 @@ async def rollup_middleware(
     elif request_type in (
         REQUEST_TYPE.BEDROCK_INVOKE,
         REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+        REQUEST_TYPE.BEDROCK_CONVERSE,
+        REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
     ):
         messages = _extract_bedrock_messages(json_body)
     else:
@@ -104,6 +108,8 @@ async def rollup_middleware(
         elif request_type in (
             REQUEST_TYPE.BEDROCK_INVOKE,
             REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+            REQUEST_TYPE.BEDROCK_CONVERSE,
+            REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
         ):
             json_body = _inject_bedrock_system_prompt(_copy_json(json_body), context)
             original_messages = json_body.get("messages", [])
@@ -165,9 +171,11 @@ async def rollup_middleware(
     elif request_type in (
         REQUEST_TYPE.BEDROCK_INVOKE,
         REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+        REQUEST_TYPE.BEDROCK_CONVERSE,
+        REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
     ):
         # Anthropic Bedrock: top-level "content" array
-        # Amazon Nova: nested "output.message.content" array
+        # Amazon Nova / Converse API: nested "output.message.content" array
         content_blocks = response_json.get("content") or (
             response_json.get("output", {}).get("message", {}).get("content", [])
         )

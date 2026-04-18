@@ -24,6 +24,17 @@ from gemini_calo.util.request import create_http_client, strip_compression_heade
 
 _default_bedrock_passthrough = create_passthrough_bedrock_provider()
 
+# Optional Bedrock-specific request headers that should be forwarded upstream when present.
+# Content-Type and Authorization are handled separately and are not in this list.
+_BEDROCK_PASSTHROUGH_HEADERS = (
+    "Accept",
+    "X-Amzn-Bedrock-Trace",
+    "X-Amzn-Bedrock-GuardrailIdentifier",
+    "X-Amzn-Bedrock-GuardrailVersion",
+    "X-Amzn-Bedrock-PerformanceConfig-Latency",
+    "X-Amzn-Bedrock-Service-Tier",
+)
+
 
 @dataclass
 class RouteConfig:
@@ -134,6 +145,8 @@ class REQUEST_TYPE(Enum):
     GEMINI_EMBEDDING: str = "gemini-embedding"
     BEDROCK_INVOKE: str = "bedrock-invoke"
     BEDROCK_STREAMING_INVOKE: str = "bedrock-streaming-invoke"
+    BEDROCK_CONVERSE: str = "bedrock-converse"
+    BEDROCK_STREAMING_CONVERSE: str = "bedrock-streaming-converse"
     OTHER: str = "other"
 
 
@@ -214,6 +227,18 @@ class GeminiProxyService:
             methods=["POST"],
             response_model=Any,
         )
+        self.bedrock_router.add_api_route(
+            "/model/{model_id:path}/converse",
+            self.forward_bedrock_request,
+            methods=["POST"],
+            response_model=Any,
+        )
+        self.bedrock_router.add_api_route(
+            "/model/{model_id:path}/converse-stream",
+            self.forward_bedrock_request,
+            methods=["POST"],
+            response_model=Any,
+        )
 
     @classmethod
     def get_request_type(cls, request: Request) -> str:
@@ -236,6 +261,10 @@ class GeminiProxyService:
                 return REQUEST_TYPE.BEDROCK_STREAMING_INVOKE
             if request.url.path.endswith("/invoke"):
                 return REQUEST_TYPE.BEDROCK_INVOKE
+            if request.url.path.endswith("/converse-stream"):
+                return REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE
+            if request.url.path.endswith("/converse"):
+                return REQUEST_TYPE.BEDROCK_CONVERSE
         return REQUEST_TYPE.OTHER
 
     def get_api_key(self) -> str:
@@ -282,10 +311,12 @@ class GeminiProxyService:
         elif request_type in (
             REQUEST_TYPE.BEDROCK_INVOKE,
             REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+            REQUEST_TYPE.BEDROCK_CONVERSE,
+            REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
         ):
             path = request.url.path
             try:
-                # /model/{model_id}/invoke  or  /model/{model_id}/invoke-with-response-stream
+                # /model/{model_id}/invoke|converse[|...]
                 after_model = path.split("/model/", 1)[1]
                 return after_model.rsplit("/", 1)[0]
             except (IndexError, ValueError):
@@ -492,7 +523,15 @@ class GeminiProxyService:
         client, auth, timeout = await self._resolve_bedrock_upstream(request)
         url = httpx.URL(path=request.url.path, query=request.url.query.encode("utf-8"))
 
-        headers = {"Content-Type": "application/json"}
+        # Bedrock Runtime uses application/json (REST-JSON protocol).
+        # Pass through whatever the client sends so we don't second-guess it.
+        headers = {
+            "Content-Type": request.headers.get("Content-Type", "application/json"),
+        }
+        for header in _BEDROCK_PASSTHROUGH_HEADERS:
+            value = request.headers.get(header)
+            if value is not None:
+                headers[header] = value
 
         logger.info(f"Forwarding Bedrock request to: {url}")
 
@@ -510,8 +549,9 @@ class GeminiProxyService:
             timeout=timeout,
         )
 
-        is_streaming = (
-            self.get_request_type(request) == REQUEST_TYPE.BEDROCK_STREAMING_INVOKE
+        is_streaming = self.get_request_type(request) in (
+            REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+            REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
         )
 
         if auth:
