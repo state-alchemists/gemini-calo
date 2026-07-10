@@ -19,7 +19,7 @@ def client(request):
     """
     model_transformer = getattr(request, "param", None)
     app = FastAPI()
-    proxy = GeminiProxyService(gemini_api_keys=["dummy-gemini-key"])
+    proxy = GeminiProxyService(api_keys=["dummy-gemini-key"])
 
     if model_transformer:
         app.middleware("http")(
@@ -32,6 +32,7 @@ def client(request):
 
 
 # --- Test Cases ---
+
 
 @pytest.mark.parametrize("client", [None], indirect=True)
 def test_no_override(client, httpx_mock):
@@ -98,12 +99,14 @@ def test_env_var_override(monkeypatch, httpx_mock):
     Tests that the middleware correctly uses the environment variable for override.
     """
     monkeypatch.setenv("GEMINI_CALO_MODEL_OVERRIDE", "gemini-ultra")
-    from gemini_calo import config
     import importlib
+
+    from gemini_calo import config
+
     importlib.reload(config)
 
     client = TestClient(FastAPI())
-    proxy = GeminiProxyService(gemini_api_keys=["dummy-gemini-key"])
+    proxy = GeminiProxyService(api_keys=["dummy-gemini-key"])
     client.app.middleware("http")(create_model_override_middleware())
     client.app.include_router(proxy.gemini_router)
     client.app.include_router(proxy.openai_router)
@@ -126,6 +129,7 @@ def model_switcher(model: str):
     if "pro" in model:
         return "gemini-1.5-flash"
     return model
+
 
 @pytest.mark.parametrize("client", [model_switcher], indirect=True)
 def test_function_override(client, httpx_mock):
@@ -151,6 +155,7 @@ async def async_model_switcher(model: str):
     if "pro" in model:
         return "gemini-1.5-flash"
     return model
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("client", [async_model_switcher], indirect=True)
