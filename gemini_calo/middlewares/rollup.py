@@ -1,10 +1,9 @@
-import json
 import hashlib
-import httpx
-from cachetools import LRUCache
+import json
 from functools import partial
 from typing import Any, Callable, Coroutine, cast
 
+from cachetools import LRUCache
 from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
 
@@ -14,6 +13,7 @@ from gemini_calo.config import (
     SUMMARIZATION_SIZE_THRESHOLD,
 )
 from gemini_calo.proxy import REQUEST_TYPE, GeminiProxyService
+from gemini_calo.util.request import create_http_client, decompress_content
 
 _lru_cache = LRUCache(maxsize=CONVERSATION_SUMMARIZATION_LRU_SIZE)
 
@@ -49,6 +49,10 @@ async def rollup_middleware(
         REQUEST_TYPE.OPENAI_COMPLETION,
         REQUEST_TYPE.GEMINI_COMPLETION,
         REQUEST_TYPE.GEMINI_STREAMING_COMPLETION,
+        REQUEST_TYPE.BEDROCK_INVOKE,
+        REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+        REQUEST_TYPE.BEDROCK_CONVERSE,
+        REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
     ]
 
     if not is_completion:
@@ -63,6 +67,13 @@ async def rollup_middleware(
     messages: list[dict] = []
     if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
         messages = _extract_openai_messages(json_body)
+    elif request_type in (
+        REQUEST_TYPE.BEDROCK_INVOKE,
+        REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+        REQUEST_TYPE.BEDROCK_CONVERSE,
+        REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
+    ):
+        messages = _extract_bedrock_messages(json_body)
     else:
         messages = _extract_gemini_messages(json_body)
 
@@ -87,11 +98,22 @@ async def rollup_middleware(
         if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
             json_body = _inject_openai_system_prompt(_copy_json(json_body), context)
             original_messages = json_body.get("messages", [])
-            system_messages = [m for m in original_messages if m.get("role") == "system"]
-            user_messages = [
-                m for m in original_messages if m.get("role") != "system"
+            system_messages = [
+                m for m in original_messages if m.get("role") == "system"
             ]
-            json_body["messages"] = system_messages + user_messages[num_matched_messages:]
+            user_messages = [m for m in original_messages if m.get("role") != "system"]
+            json_body["messages"] = (
+                system_messages + user_messages[num_matched_messages:]
+            )
+        elif request_type in (
+            REQUEST_TYPE.BEDROCK_INVOKE,
+            REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+            REQUEST_TYPE.BEDROCK_CONVERSE,
+            REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
+        ):
+            json_body = _inject_bedrock_system_prompt(_copy_json(json_body), context)
+            original_messages = json_body.get("messages", [])
+            json_body["messages"] = original_messages[num_matched_messages:]
         else:
             json_body = _inject_gemini_system_prompt(_copy_json(json_body), context)
             json_body["contents"] = messages[num_matched_messages:]
@@ -108,7 +130,7 @@ async def rollup_middleware(
 
     # Response handling
     response_body = b""
-    if hasattr(response, 'body_iterator'): # Check if it's a streaming response
+    if hasattr(response, "body_iterator"):  # Check if it's a streaming response
         # Read the entire streaming response into response_body
         async for chunk in response.body_iterator:
             response_body += chunk
@@ -116,7 +138,7 @@ async def rollup_middleware(
         return_response = StreamingResponse(
             iter([response_body]),
             status_code=response.status_code,
-            headers=response.headers
+            headers=response.headers,
         )
     else:
         response_body = response.body  # For regular responses, use .body
@@ -124,26 +146,60 @@ async def rollup_middleware(
         return_response = Response(
             content=response_body,
             status_code=response.status_code,
-            headers=response.headers
+            headers=response.headers,
         )
 
+    # Add gzip detection and decompression before JSON parsing
+    # Check if response is compressed
+    content_encoding = response.headers.get("content-encoding")
+    if content_encoding:
+        response_body = decompress_content(response_body, content_encoding)
+
+    # Bedrock streaming responses use binary AWS Event Stream format, not JSON
+    is_binary_streaming = request_type in (
+        REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+        REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
+    )
     try:
-        response_json = json.loads(response_body)
-    except json.JSONDecodeError:
+        response_json = {} if is_binary_streaming else json.loads(response_body)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        response_json = {}
+
+    # Handle case where response_json might be a list (from streaming responses)
+    if not isinstance(response_json, dict):
         response_json = {}
 
     assistant_message = {}
     if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
         choice = response_json.get("choices", [{}])[0]
         assistant_message = choice.get("message", {})
-    else: # Gemini
+    elif request_type in (
+        REQUEST_TYPE.BEDROCK_INVOKE,
+        REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+        REQUEST_TYPE.BEDROCK_CONVERSE,
+        REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
+    ):
+        # Anthropic Bedrock: top-level "content" array
+        # Amazon Nova / Converse API: nested "output.message.content" array
+        content_blocks = response_json.get("content") or (
+            response_json.get("output", {}).get("message", {}).get("content", [])
+        )
+        if content_blocks:
+            text = " ".join(
+                b.get("text", "")
+                for b in content_blocks
+                if isinstance(b, dict) and "text" in b
+            )
+            # Store in array format so it round-trips correctly into future requests
+            assistant_message = {"role": "assistant", "content": [{"text": text}]}
+    else:  # Gemini
         candidate = response_json.get("candidates", [{}])[0]
         assistant_message = candidate.get("content", {})
 
     if assistant_message:
         new_history = messages + [assistant_message]
         new_key = _get_message_key(new_history)
-        
+
         conversation_text = json.dumps(new_history)
         if len(conversation_text) > conversation_size_threshold:
             summary = await _summarize_conversation(
@@ -153,7 +209,7 @@ async def rollup_middleware(
         else:
             cache[new_key] = conversation_text
 
-    return return_response if 'return_response' in locals() else response
+    return return_response if "return_response" in locals() else response
 
 
 def _extract_openai_messages(body: dict) -> list[dict]:
@@ -163,6 +219,11 @@ def _extract_openai_messages(body: dict) -> list[dict]:
 
 def _extract_gemini_messages(body: dict) -> list[dict]:
     return body.get("contents", [])
+
+
+def _extract_bedrock_messages(body: dict) -> list[dict]:
+    messages = body.get("messages", [])
+    return [m for m in messages if m.get("role") != "system"]
 
 
 def _get_message_key(messages: list[dict]) -> str:
@@ -183,13 +244,30 @@ def _inject_openai_system_prompt(body: dict, context: str) -> dict:
     return body
 
 
+def _inject_bedrock_system_prompt(body: dict, context: str) -> dict:
+    existing = body.get("system")
+    if isinstance(existing, list):
+        # Nova-style: system is an array of content objects
+        body["system"] = [{"text": context}] + existing
+    elif isinstance(existing, str) and existing:
+        # Anthropic-style: system is a plain string
+        body["system"] = f"{context}\n{existing}"
+    else:
+        # No existing system — infer format from messages content
+        messages = body.get("messages", [])
+        first_content = messages[0].get("content", "") if messages else ""
+        if isinstance(first_content, list):
+            body["system"] = [{"text": context}]
+        else:
+            body["system"] = context
+    return body
+
+
 def _inject_gemini_system_prompt(body: dict, context: str) -> dict:
     if "system_instruction" in body:
         existing_instruction = body["system_instruction"]
         if isinstance(existing_instruction, dict):
-            existing_text = existing_instruction.get(
-                "parts", [{}]
-            )[0].get("text", "")
+            existing_text = existing_instruction.get("parts", [{}])[0].get("text", "")
             new_text = f"{context}\n{existing_text}"
             existing_instruction["parts"][0]["text"] = new_text
         else:
@@ -208,19 +286,20 @@ async def _summarize_conversation(
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     payload = {
         "contents": [
-            {"role": "user", "parts": [{"text": f"{DEFAULT_SUMMARIZER_PROMPT}\n\n{conversation}"}]}
+            {
+                "role": "user",
+                "parts": [{"text": f"{DEFAULT_SUMMARIZER_PROMPT}\n\n{conversation}"}],
+            }
         ]
     }
-    async with httpx.AsyncClient() as client:
+    async with create_http_client() as client:
         try:
-            response = await client.post(
-                url, json=payload, headers=headers, timeout=60
-            )
+            response = await client.post(url, json=payload, headers=headers, timeout=60)
             response.raise_for_status()
             data = response.json()
             summary = data["candidates"][0]["content"]["parts"][0]["text"]
             return f"{summary}\n\nVerbatim Transcript:\n{conversation}"
-        except (httpx.HTTPStatusError, KeyError, IndexError) as e:
+        except Exception as e:
             # In case of summarization failure,
             # return the original conversation
             return f"Summarization failed: {e}. Original conversation: {conversation}"

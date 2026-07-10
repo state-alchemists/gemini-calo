@@ -25,12 +25,15 @@ def client(mock_logger):
 
     @app.post("/regular")
     async def regular_endpoint():
-        return Response(content=json.dumps({"message": "hello"}), media_type="application/json")
+        return Response(
+            content=json.dumps({"message": "hello"}), media_type="application/json"
+        )
 
     @app.post("/streaming")
     async def streaming_endpoint():
         async def content():
             yield b'{"message": "hello"}'
+
         return StreamingResponse(content(), media_type="application/json")
 
     return TestClient(app)
@@ -42,7 +45,7 @@ def test_logging_middleware_regular_response(client, mock_logger):
     """
     response = client.post("/regular", json={"message": "world"})
     assert response.status_code == 200
-    assert mock_logger.info.call_count == 5
+    assert mock_logger.info.call_count == 6  # Now includes response body logging
 
 
 def test_logging_middleware_streaming_response(client, mock_logger):
@@ -51,4 +54,4 @@ def test_logging_middleware_streaming_response(client, mock_logger):
     """
     response = client.post("/streaming", json={"message": "world"})
     assert response.status_code == 200
-    assert mock_logger.info.call_count == 5
+    assert mock_logger.info.call_count == 6  # Now includes response body logging

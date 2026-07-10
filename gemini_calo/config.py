@@ -23,7 +23,7 @@ _LOG_LEVEL_MAP = {
     "WARN": logging.WARN,
     "INFO": logging.INFO,
     "DEBUG": logging.DEBUG,
-    "NOTSET": logging.NOTSET
+    "NOTSET": logging.NOTSET,
 }
 LOG_LEVEL = _LOG_LEVEL_MAP.get(
     os.getenv("GEMINI_CALO_LOG_LEVEL", "").upper(), logging.CRITICAL
@@ -40,7 +40,7 @@ The summary must include the following two parts:
 1.  **Context**: A brief summary of the conversation's context.
 2.  **Transcript**: The verbatim conversation transcript.
 
-Here is the conversation:"""
+Here is the conversation:""",
 )
 
 SUMMARIZATION_SIZE_THRESHOLD = int(
