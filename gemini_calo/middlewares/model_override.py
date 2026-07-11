@@ -42,7 +42,10 @@ async def model_override_middleware(
 
     request_type = GeminiProxyService.get_request_type(request)
 
-    if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
+    if request_type in [
+        REQUEST_TYPE.OPENAI_COMPLETION,
+        REQUEST_TYPE.OPENAI_RESPONSES,
+    ]:
         request = await _transform_model_in_openai_request(request, transformer)
     elif request_type in [
         REQUEST_TYPE.GEMINI_COMPLETION,

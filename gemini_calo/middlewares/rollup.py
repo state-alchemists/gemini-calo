@@ -12,6 +12,7 @@ from gemini_calo.config import (
     DEFAULT_SUMMARIZER_PROMPT,
     SUMMARIZATION_SIZE_THRESHOLD,
 )
+from gemini_calo.logger import logger
 from gemini_calo.proxy import REQUEST_TYPE, GeminiProxyService
 from gemini_calo.util.request import create_http_client, decompress_content
 
@@ -92,8 +93,10 @@ async def rollup_middleware(
 
     original_request = request
     if found_key:
-        print(f"found_key: {found_key}")
-        print(f"num_matched_messages: {num_matched_messages}")
+        logger.debug(
+            f"Rollup cache hit: key={found_key}, "
+            f"matched_messages={num_matched_messages}"
+        )
         context = cast(str, cache[found_key])
         if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
             json_body = _inject_openai_system_prompt(_copy_json(json_body), context)
@@ -128,88 +131,83 @@ async def rollup_middleware(
 
     response = await call_next(request)
 
-    # Response handling
-    response_body = b""
-    if hasattr(response, "body_iterator"):  # Check if it's a streaming response
-        # Read the entire streaming response into response_body
-        async for chunk in response.body_iterator:
-            response_body += chunk
-        # Create a new StreamingResponse from the captured body for the client
-        return_response = StreamingResponse(
-            iter([response_body]),
+    async def update_cache(response_body: bytes) -> None:
+        # Add gzip detection and decompression before JSON parsing
+        content_encoding = response.headers.get("content-encoding")
+        if content_encoding:
+            response_body = decompress_content(response_body, content_encoding)
+
+        # Bedrock streaming responses use binary AWS Event Stream format, not JSON
+        is_binary_streaming = request_type in (
+            REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+            REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
+        )
+        try:
+            response_json = {} if is_binary_streaming else json.loads(response_body)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            response_json = {}
+
+        # Handle case where response_json might be a list (from streaming responses)
+        if not isinstance(response_json, dict):
+            response_json = {}
+
+        assistant_message = {}
+        if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
+            choice = response_json.get("choices", [{}])[0]
+            assistant_message = choice.get("message", {})
+        elif request_type in (
+            REQUEST_TYPE.BEDROCK_INVOKE,
+            REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
+            REQUEST_TYPE.BEDROCK_CONVERSE,
+            REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
+        ):
+            # Anthropic Bedrock: top-level "content" array
+            # Amazon Nova / Converse API: nested "output.message.content" array
+            content_blocks = response_json.get("content") or (
+                response_json.get("output", {}).get("message", {}).get("content", [])
+            )
+            if content_blocks:
+                text = " ".join(
+                    b.get("text", "")
+                    for b in content_blocks
+                    if isinstance(b, dict) and "text" in b
+                )
+                # Store in array format so it round-trips into future requests
+                assistant_message = {"role": "assistant", "content": [{"text": text}]}
+        else:  # Gemini
+            candidate = response_json.get("candidates", [{}])[0]
+            assistant_message = candidate.get("content", {})
+
+        if assistant_message:
+            new_history = messages + [assistant_message]
+            new_key = _get_message_key(new_history)
+
+            conversation_text = json.dumps(new_history)
+            if len(conversation_text) > conversation_size_threshold:
+                summary = await _summarize_conversation(
+                    conversation_text, gemini_proxy.get_gemini_api_key()
+                )
+                cache[new_key] = summary
+            else:
+                cache[new_key] = conversation_text
+
+    if hasattr(response, "body_iterator"):  # Streaming response
+        # Pass chunks through as they arrive; update the cache once complete
+        async def stream_and_capture():
+            chunks: list[bytes] = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+                yield chunk
+            await update_cache(b"".join(chunks))
+
+        return StreamingResponse(
+            stream_and_capture(),
             status_code=response.status_code,
             headers=response.headers,
         )
-    else:
-        response_body = response.body  # For regular responses, use .body
-        # Create a new response from the captured body for the client
-        return_response = Response(
-            content=response_body,
-            status_code=response.status_code,
-            headers=response.headers,
-        )
 
-    # Add gzip detection and decompression before JSON parsing
-    # Check if response is compressed
-    content_encoding = response.headers.get("content-encoding")
-    if content_encoding:
-        response_body = decompress_content(response_body, content_encoding)
-
-    # Bedrock streaming responses use binary AWS Event Stream format, not JSON
-    is_binary_streaming = request_type in (
-        REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
-        REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
-    )
-    try:
-        response_json = {} if is_binary_streaming else json.loads(response_body)
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
-        response_json = {}
-
-    # Handle case where response_json might be a list (from streaming responses)
-    if not isinstance(response_json, dict):
-        response_json = {}
-
-    assistant_message = {}
-    if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
-        choice = response_json.get("choices", [{}])[0]
-        assistant_message = choice.get("message", {})
-    elif request_type in (
-        REQUEST_TYPE.BEDROCK_INVOKE,
-        REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
-        REQUEST_TYPE.BEDROCK_CONVERSE,
-        REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
-    ):
-        # Anthropic Bedrock: top-level "content" array
-        # Amazon Nova / Converse API: nested "output.message.content" array
-        content_blocks = response_json.get("content") or (
-            response_json.get("output", {}).get("message", {}).get("content", [])
-        )
-        if content_blocks:
-            text = " ".join(
-                b.get("text", "")
-                for b in content_blocks
-                if isinstance(b, dict) and "text" in b
-            )
-            # Store in array format so it round-trips correctly into future requests
-            assistant_message = {"role": "assistant", "content": [{"text": text}]}
-    else:  # Gemini
-        candidate = response_json.get("candidates", [{}])[0]
-        assistant_message = candidate.get("content", {})
-
-    if assistant_message:
-        new_history = messages + [assistant_message]
-        new_key = _get_message_key(new_history)
-
-        conversation_text = json.dumps(new_history)
-        if len(conversation_text) > conversation_size_threshold:
-            summary = await _summarize_conversation(
-                conversation_text, gemini_proxy.get_gemini_api_key()
-            )
-            cache[new_key] = summary
-        else:
-            cache[new_key] = conversation_text
-
-    return return_response if "return_response" in locals() else response
+    await update_cache(response.body)
+    return response
 
 
 def _extract_openai_messages(body: dict) -> list[dict]:

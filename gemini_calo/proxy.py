@@ -139,6 +139,7 @@ class RouteConfig:
 
 class REQUEST_TYPE(Enum):
     OPENAI_COMPLETION: str = "openai-completion"
+    OPENAI_RESPONSES: str = "openai-responses"
     OPENAI_EMBEDDING: str = "openai-embedding"
     GEMINI_COMPLETION: str = "gemini-completion"
     GEMINI_STREAMING_COMPLETION: str = "gemini-streaming-completion"
@@ -154,13 +155,13 @@ class GeminiProxyService:
     def __init__(
         self,
         base_url: str = "https://generativelanguage.googleapis.com",
-        api_keys: list[str] = [],
-        model_routes: dict[str, RouteConfig] = {},
+        api_keys: list[str] | None = None,
+        model_routes: dict[str, RouteConfig] | None = None,
     ):
-        self._api_keys = api_keys
+        self._api_keys = api_keys if api_keys is not None else []
         self._current_api_key_index = 0
         self._base_url = base_url
-        self._model_routes = model_routes
+        self._model_routes = model_routes if model_routes is not None else {}
         self.openai_router = APIRouter()
         self.gemini_router = APIRouter()
         self.bedrock_router = APIRouter()
@@ -175,6 +176,12 @@ class GeminiProxyService:
         )
         self.openai_router.add_api_route(
             "/v1/embeddings",
+            self.forward_openai_request,
+            methods=["POST"],
+            response_model=Any,
+        )
+        self.openai_router.add_api_route(
+            "/v1/responses",
             self.forward_openai_request,
             methods=["POST"],
             response_model=Any,
@@ -247,6 +254,8 @@ class GeminiProxyService:
             "/v1beta/openai/chat/completions",
         ):
             return REQUEST_TYPE.OPENAI_COMPLETION
+        if request.url.path == "/v1/responses":
+            return REQUEST_TYPE.OPENAI_RESPONSES
         if request.url.path in ("/v1/embeddings", "/v1beta/openai/embeddings"):
             return REQUEST_TYPE.OPENAI_EMBEDDING
         if request.url.path.startswith("/v1beta/models/"):
@@ -301,6 +310,7 @@ class GeminiProxyService:
                 return None
         elif request_type in (
             REQUEST_TYPE.OPENAI_COMPLETION,
+            REQUEST_TYPE.OPENAI_RESPONSES,
             REQUEST_TYPE.OPENAI_EMBEDDING,
         ):
             try:
@@ -375,6 +385,62 @@ class GeminiProxyService:
 
         return client, auth, 300.0
 
+    async def _send_upstream(
+        self,
+        request: Request,
+        client: httpx.AsyncClient,
+        auth: httpx.Auth | None,
+        headers: dict[str, str],
+        timeout: float,
+        is_streaming: bool,
+        path: str | None = None,
+    ) -> Response:
+        """Build, send, and wrap the upstream request. Shared by all forwarders."""
+        url = httpx.URL(
+            path=path or request.url.path, query=request.url.query.encode("utf-8")
+        )
+        content = (
+            request.state.modified_body
+            if hasattr(request.state, "modified_body")
+            else request.stream()
+        )
+        req = client.build_request(
+            request.method,
+            url,
+            headers=headers,
+            content=content,
+            timeout=timeout,
+        )
+        if auth:
+            response = await client.send(req, auth=auth, stream=is_streaming)
+        else:
+            response = await client.send(req, stream=is_streaming)
+
+        if is_streaming:
+            return StreamingResponse(
+                response.aiter_raw(),
+                status_code=response.status_code,
+                headers=strip_compression_headers(dict(response.headers)),
+            )
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=strip_compression_headers(dict(response.headers)),
+        )
+
+    @staticmethod
+    async def _body_requests_streaming(request: Request) -> bool:
+        """True if the JSON request body sets "stream": true (OpenAI-style)."""
+        raw = (
+            request.state.modified_body
+            if hasattr(request.state, "modified_body")
+            else await request.body()
+        )
+        try:
+            return json.loads(raw).get("stream") is True
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            return False
+
     async def forward_openai_request(self, request: Request) -> Response:
         """Forward openai request"""
         client, auth, timeout = await self._resolve_upstream(request, "bearer")
@@ -390,56 +456,19 @@ class GeminiProxyService:
             elif path == "/v1/embeddings":
                 path = "/v1beta/openai/embeddings"
 
-        url = httpx.URL(path=path, query=request.url.query.encode("utf-8"))
+        logger.info(f"Forwarding OpenAI request to: {path}")
 
-        # Start with content-type header; auth will be added by httpx.Auth
-        headers = {"Content-Type": "application/json"}
+        # OpenAI-style requests carry "stream": true in the body
+        is_streaming = await self._body_requests_streaming(request)
 
-        # Add any other headers from the original request that should be forwarded
-        # (excluding auth headers which are handled by the auth provider)
-
-        logger.info(f"Forwarding OpenAI request to: {url}")
-
-        # Get request body
-        content = (
-            request.state.modified_body
-            if hasattr(request.state, "modified_body")
-            else request.stream()
-        )
-
-        req = client.build_request(
-            request.method,
-            url,
-            headers=headers,
-            content=content,
+        return await self._send_upstream(
+            request,
+            client,
+            auth,
+            headers={"Content-Type": "application/json"},
             timeout=timeout,
-        )
-
-        # Determine if streaming
-        request_type = self.get_request_type(request)
-        is_streaming = request.url.path.endswith(":streamGenerateContent") or (
-            request_type == REQUEST_TYPE.OPENAI_COMPLETION
-            and hasattr(request.state, "stream")
-            and request.state.stream
-        )
-
-        # Send with auth
-        if auth:
-            response = await client.send(req, auth=auth, stream=is_streaming)
-        else:
-            response = await client.send(req, stream=is_streaming)
-
-        if is_streaming:
-            return StreamingResponse(
-                response.aiter_raw(),
-                status_code=response.status_code,
-                headers=strip_compression_headers(dict(response.headers)),
-            )
-
-        return Response(
-            content=response.content,
-            status_code=response.status_code,
-            headers=strip_compression_headers(dict(response.headers)),
+            is_streaming=is_streaming,
+            path=path,
         )
 
     async def _resolve_bedrock_upstream(
@@ -473,55 +502,21 @@ class GeminiProxyService:
     async def forward_gemini_request(self, request: Request) -> Response:
         """Forward gemini request"""
         client, auth, timeout = await self._resolve_upstream(request, "x-goog-api-key")
-        url = httpx.URL(path=request.url.path, query=request.url.query.encode("utf-8"))
 
-        headers = {"Content-Type": "application/json"}
+        logger.info(f"Forwarding Gemini request to: {request.url.path}")
 
-        logger.info(f"Forwarding Gemini request to: {url}")
-
-        content = (
-            request.state.modified_body
-            if hasattr(request.state, "modified_body")
-            else request.stream()
-        )
-
-        req = client.build_request(
-            request.method,
-            url,
-            headers=headers,
-            content=content,
+        return await self._send_upstream(
+            request,
+            client,
+            auth,
+            headers={"Content-Type": "application/json"},
             timeout=timeout,
-        )
-
-        request_type = self.get_request_type(request)
-        is_streaming = request.url.path.endswith(":streamGenerateContent") or (
-            request_type == REQUEST_TYPE.OPENAI_COMPLETION
-            and hasattr(request.state, "stream")
-            and request.state.stream
-        )
-
-        if auth:
-            response = await client.send(req, auth=auth, stream=is_streaming)
-        else:
-            response = await client.send(req, stream=is_streaming)
-
-        if is_streaming:
-            return StreamingResponse(
-                response.aiter_raw(),
-                status_code=response.status_code,
-                headers=strip_compression_headers(dict(response.headers)),
-            )
-
-        return Response(
-            content=response.content,
-            status_code=response.status_code,
-            headers=strip_compression_headers(dict(response.headers)),
+            is_streaming=request.url.path.endswith(":streamGenerateContent"),
         )
 
     async def forward_bedrock_request(self, request: Request) -> Response:
         """Forward AWS Bedrock runtime request."""
         client, auth, timeout = await self._resolve_bedrock_upstream(request)
-        url = httpx.URL(path=request.url.path, query=request.url.query.encode("utf-8"))
 
         # Bedrock Runtime uses application/json (REST-JSON protocol).
         # Pass through whatever the client sends so we don't second-guess it.
@@ -533,41 +528,18 @@ class GeminiProxyService:
             if value is not None:
                 headers[header] = value
 
-        logger.info(f"Forwarding Bedrock request to: {url}")
-
-        content = (
-            request.state.modified_body
-            if hasattr(request.state, "modified_body")
-            else request.stream()
-        )
-
-        req = client.build_request(
-            request.method,
-            url,
-            headers=headers,
-            content=content,
-            timeout=timeout,
-        )
+        logger.info(f"Forwarding Bedrock request to: {request.url.path}")
 
         is_streaming = self.get_request_type(request) in (
             REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
             REQUEST_TYPE.BEDROCK_STREAMING_CONVERSE,
         )
 
-        if auth:
-            response = await client.send(req, auth=auth, stream=is_streaming)
-        else:
-            response = await client.send(req, stream=is_streaming)
-
-        if is_streaming:
-            return StreamingResponse(
-                response.aiter_raw(),
-                status_code=response.status_code,
-                headers=strip_compression_headers(dict(response.headers)),
-            )
-
-        return Response(
-            content=response.content,
-            status_code=response.status_code,
-            headers=strip_compression_headers(dict(response.headers)),
+        return await self._send_upstream(
+            request,
+            client,
+            auth,
+            headers=headers,
+            timeout=timeout,
+            is_streaming=is_streaming,
         )

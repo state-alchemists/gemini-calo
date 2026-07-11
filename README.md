@@ -8,7 +8,7 @@ One of its key features is providing an OpenAI-compatible endpoint, allowing you
 
 *   **Authentication:** Secure your Gemini API access with an additional layer of API key authentication.
 *   **Request Logging:** Detailed logging of all incoming requests and outgoing responses.
-*   **OpenAI Compatibility:** Use Gemini models through an OpenAI-compatible `/v1/chat/completions` endpoint.
+*   **OpenAI Compatibility:** Use Gemini models through an OpenAI-compatible `/v1/chat/completions` endpoint. A `/v1/responses` passthrough is also available for OpenAI Responses API clients (e.g. Codex CLI) targeting a Responses-native upstream via model routes — no translation to Gemini/Bedrock is performed.
 *   **AWS Bedrock Compatibility:** Native Bedrock endpoints covering both the InvokeModel API (`/model/{modelId}/invoke`, `/model/{modelId}/invoke-with-response-stream`) and the Converse API (`/model/{modelId}/converse`, `/model/{modelId}/converse-stream`) — supports both Bedrock API key (bearer token) and SigV4 signing.
 *   **Round-Robin API Keys:** Distribute your requests across multiple API keys, both globally and per model route.
 *   **Multi-Provider Routing:** Route specific models (via glob patterns) to different upstream providers — use OpenAI, Anthropic, AWS Bedrock, or any OpenAI-compatible endpoint alongside Gemini.
