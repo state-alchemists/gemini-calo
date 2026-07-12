@@ -1,17 +1,21 @@
 # Gemini Calo
 
-**Gemini Calo** is a powerful, yet simple, FastAPI-based proxy server for Google's Gemini API. It provides a seamless way to add a layer of authentication, logging, and monitoring to your Gemini API requests. It's designed to be run as a standalone server or integrated into your existing FastAPI applications.
+**Gemini Calo** is a powerful, yet simple, FastAPI-based proxy that puts a single, authenticated, observable front door in front of **many LLM providers**. It began as a proxy for Google's Gemini API and is now a small **universal LLM hub**: point your client at Calo and it handles authentication, request logging, and conversation rollup — and, crucially, **protocol translation**.
 
-One of its key features is providing an OpenAI-compatible endpoint, allowing you to use Gemini models with tools and libraries that are built for the OpenAI API. It also exposes native **AWS Bedrock-compatible endpoints** (InvokeModel and Converse APIs), so any client that targets `bedrock-runtime` works without changes.
+A client that speaks **OpenAI Chat Completions**, the **OpenAI Responses API**, or **Anthropic Messages** can be served by **Google Gemini**, **AWS Bedrock** (InvokeModel *or* Converse), **real OpenAI**, or any **OpenAI-compatible** upstream — chosen per model, with no change to the client. Calo also exposes the **native Gemini** and **native Bedrock** wire APIs as authenticated passthroughs for clients that already speak those formats. See [Supported Routes & Provider Interchangeability](#supported-routes--provider-interchangeability) for the full picture.
+
+It's designed to run as a standalone server or mount into an existing FastAPI application.
 
 ## Key Features
 
-*   **Authentication:** Secure your Gemini API access with an additional layer of API key authentication.
+*   **Universal, interchangeable providers:** Serve one client protocol from any upstream provider. An OpenAI, Responses, or Anthropic-Messages client can talk to Gemini, Bedrock, or OpenAI-compatible backends, selected per model via glob-matched routes — the client never knows which provider actually answered.
+*   **Authentication:** Secure access with an additional layer of proxy API-key authentication in front of every provider.
 *   **Request Logging:** Detailed logging of all incoming requests and outgoing responses.
-*   **OpenAI Compatibility:** Use Gemini models through an OpenAI-compatible `/v1/chat/completions` endpoint. A `/v1/responses` passthrough is also available for OpenAI Responses API clients (e.g. Codex CLI) targeting a Responses-native upstream via model routes — no translation to Gemini/Bedrock is performed.
+*   **OpenAI Compatibility:** OpenAI Chat Completions (`/v1/chat/completions`) and Responses (`/v1/responses`) endpoints. Requests are translated to the routed upstream (Gemini/Bedrock/OpenAI-compatible), or passed through verbatim to a native OpenAI/Responses upstream.
+*   **Anthropic Compatibility:** An Anthropic Messages endpoint (`/v1/messages`) that translates to whichever provider the model routes to.
 *   **AWS Bedrock Compatibility:** Native Bedrock endpoints covering both the InvokeModel API (`/model/{modelId}/invoke`, `/model/{modelId}/invoke-with-response-stream`) and the Converse API (`/model/{modelId}/converse`, `/model/{modelId}/converse-stream`) — supports both Bedrock API key (bearer token) and SigV4 signing.
 *   **Round-Robin API Keys:** Distribute your requests across multiple API keys, both globally and per model route.
-*   **Multi-Provider Routing:** Route specific models (via glob patterns) to different upstream providers — use OpenAI, Anthropic, AWS Bedrock, or any OpenAI-compatible endpoint alongside Gemini.
+*   **Multi-Provider Routing:** Route specific models (via glob patterns) to different upstream providers and protocols, each with its own credentials and timeout.
 *   **Extensible Authentication:** Support for complex auth schemes like AWS SigV4, OAuth, or custom providers via pluggable auth modules.
 *   **Easy Integration:** Use it as a standalone server or mount it into your existing FastAPI project.
 *   **Extensible:** Easily add your own custom middleware to suit your needs.
@@ -21,7 +25,69 @@ One of its key features is providing an OpenAI-compatible endpoint, allowing you
 -   **Centralized API Key Management:** Instead of hardcoding your Gemini API keys in various clients, you can manage them in one place.
 -   **Security:** Protect your expensive Gemini API keys by exposing only a proxy key to your users or client applications.
 -   **Monitoring & Observability:** The logging middleware gives you insight into how your API is being used, helping you debug issues and monitor usage patterns.
--   **Seamless Migration:** If you have existing tools that use the OpenAI API, you can switch to using Google's Gemini models without significant code changes.
+-   **Seamless Migration:** Existing OpenAI, Responses, or Anthropic-Messages tooling can switch to Gemini, Bedrock, or any OpenAI-compatible backend without significant code changes — usually just a base URL and a model name.
+
+## Supported Routes & Provider Interchangeability
+
+Calo separates **what your client speaks** (the inbound route) from **what actually serves the request** (the upstream provider). Any *translatable* client protocol can be served by any supported provider, chosen per model through [`model_routes`](#routing-models-to-different-providers).
+
+### Client-facing routes (what your client calls)
+
+| Client protocol | Routes | Translatable? |
+|---|---|---|
+| OpenAI Chat Completions | `POST /v1/chat/completions`, `POST /v1beta/openai/chat/completions` | ✅ |
+| OpenAI Responses | `POST /v1/responses` | ✅ |
+| Anthropic Messages | `POST /v1/messages` | ✅ |
+| OpenAI Embeddings | `POST /v1/embeddings`, `POST /v1beta/openai/embeddings` | passthrough |
+| Gemini (native) | `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:embedContent`; `GET /v1beta/models` | passthrough |
+| Bedrock InvokeModel (native) | `POST /model/{modelId}/invoke`, `/invoke-with-response-stream` | passthrough |
+| Bedrock Converse (native) | `POST /model/{modelId}/converse`, `/converse-stream` | passthrough |
+
+**Translatable** routes are converted through a canonical intermediate representation (IR) to whichever upstream the model routes to. The **native** Gemini and Bedrock routes are authenticated passthroughs — they forward to the matching native upstream unchanged, with logging, auth, model-override, and rollup still applied.
+
+### Upstream providers (what serves the request)
+
+Set per route via `RouteConfig.protocol` (see [Routing Models to Different Providers](#routing-models-to-different-providers)):
+
+| `protocol` | Upstream it targets | Translation |
+|---|---|---|
+| `"openai"` (default) | Real OpenAI, or any upstream that already speaks the client's exact protocol | none — verbatim passthrough |
+| `"openai-chat"` | Chat-Completions-only backends (DeepSeek, Together, …) | client → `/v1/chat/completions` |
+| `"gemini"` | Google Gemini native API | client → Gemini |
+| `"bedrock-invoke"` | AWS Bedrock InvokeModel API | client → Bedrock InvokeModel |
+| `"bedrock-converse"` | AWS Bedrock Converse API | client → Bedrock Converse |
+
+> With `protocol="openai"` (the default), no translation happens — so the upstream must already speak whatever the client sent (e.g. a Responses client can only passthrough to a Responses-native upstream). To reach Gemini/Bedrock, or to serve an OpenAI-only backend from a Responses/Anthropic client, set an explicit translating `protocol`.
+
+### The interchangeability matrix
+
+Because translation is split into an inbound half (client → IR) and an outbound half (IR → upstream), **any translatable client can be served by any provider**:
+
+| Client ↓ / Upstream → | Gemini | Bedrock Invoke | Bedrock Converse | OpenAI-chat | OpenAI (passthrough) |
+|---|:---:|:---:|:---:|:---:|:---:|
+| OpenAI Chat | ✅ | ✅ | ✅ | ✅ | ✅ |
+| OpenAI Responses | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Anthropic Messages | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+The client sends the request it always would; you decide which provider answers by matching the model name to a route. Moving a model from Gemini to Bedrock is a **one-line route change** — no client edits. Calo also normalizes provider quirks along the way (e.g. stripping JSON-Schema keywords Gemini rejects, clamping Nova's `max_tokens`), so the same tool-using client works everywhere.
+
+### Known limitation: Gemini thought signatures on the translated path
+
+When a client protocol (OpenAI Chat, OpenAI Responses, or Anthropic Messages) is **translated to a Gemini upstream** (`protocol="gemini"`), Calo does **not** currently round-trip Gemini's `thoughtSignature`. Gemini returns an opaque `thoughtSignature` on each `functionCall`; on the next turn it expects that signature echoed back. Calo's IR drops it during translation, so multi-turn tool-calling conversations resend function calls without their signature. The impact depends on the Gemini model:
+
+| Model family | Effect of the missing signature |
+|---|---|
+| Gemini 2.5 | Non-fatal **warning** — *"missing thought_signature … may lead to degraded model performance."* Tool calls still work. |
+| Gemini 3 (`gemini-3-*`) | **Hard `400 INVALID_ARGUMENT`** — the API strictly requires the signature, so multi-turn tool loops fail. |
+
+**Not affected:** the **native Gemini passthrough** (`gemini_router`, e.g. the google-genai SDK), which forwards requests unmodified so the SDK preserves the signature itself; non-Gemini upstreams (Bedrock, OpenAI-compatible), which don't use thought signatures; and any single-turn or non-tool request.
+
+**Workarounds until this is fixed:**
+
+- For tool-heavy agents on **Gemini 3**, use the **native Gemini endpoint** rather than the OpenAI/Anthropic-translated path, or route those models to a **non-Gemini** provider (e.g. Bedrock Nova/Claude).
+- **Gemini 2.5** models tolerate the missing signature (degraded, not broken).
+
+The tractable fix is to carry the signature through the round-tripping `tool_call.id`; see the [Gemini thought-signatures docs](https://ai.google.dev/gemini-api/docs/thinking#signatures) for the requirement.
 
 ## Running the Built-in Server
 
@@ -100,9 +166,14 @@ if proxy_api_keys:
 # 3. (Optional) Add Logging Middleware
 app.middleware("http")(logging_middleware)
 
-# 4. Mount the Gemini, OpenAI, and Bedrock routers
-app.include_router(proxy_service.gemini_router)
+# 4. Mount the routers you want to expose.
+#    - openai_router:    /v1/chat/completions, /v1/responses, /v1/embeddings
+#    - anthropic_router: /v1/messages (Anthropic Messages, e.g. Claude Code)
+#    - gemini_router:    native Gemini passthrough
+#    - bedrock_router:   native Bedrock Invoke + Converse passthrough
 app.include_router(proxy_service.openai_router)
+app.include_router(proxy_service.anthropic_router)
+app.include_router(proxy_service.gemini_router)
 app.include_router(proxy_service.bedrock_router)
 
 @app.get("/health")
@@ -115,7 +186,9 @@ def health_check():
 
 ## Routing Models to Different Providers
 
-`GeminiProxyService` supports a `model_routes` parameter — a `dict` that maps glob patterns to a `RouteConfig`. When a request arrives, the proxy extracts the model name (from the URL path for Gemini-format requests, or from the JSON body for OpenAI-format requests) and checks it against each pattern in order. The first match wins; unmatched models fall back to `base_url` + `api_keys`.
+`GeminiProxyService` supports a `model_routes` parameter — a `dict` that maps glob patterns to a `RouteConfig`. When a request arrives, the proxy extracts the model name (from the URL path for Gemini/Bedrock-format requests, or from the JSON body for OpenAI/Anthropic-format requests) and checks it against each pattern in order. The first match wins; unmatched models fall back to `base_url` + `api_keys`.
+
+The route's `protocol` is what makes providers interchangeable: it selects the outbound adapter that translates the incoming request to the upstream's native API. See [Supported Routes & Provider Interchangeability](#supported-routes--provider-interchangeability) for the full matrix.
 
 ### `RouteConfig` fields
 
@@ -124,7 +197,10 @@ def health_check():
 | `url` | `str` | — | Upstream base URL for this route |
 | `api_keys` | `list[str]` | `[]` | Keys rotated round-robin for preset auth types |
 | `auth` | `str` \| `callable` \| `None` | `"bearer"` | Authentication configuration (see below) |
+| `protocol` | `str` | `"openai"` | Upstream protocol / outbound adapter: `"openai"` (passthrough), `"openai-chat"`, `"gemini"`, `"bedrock-invoke"`, `"bedrock-converse"` |
+| `upstream_model` | `str` | `""` | If set, replaces the client's model id when calling upstream. Handy for friendly aliases (`nova` → `amazon.nova-pro-v1:0`) and clients that mangle ids containing `:` (zrb). Only applied on the translated path |
 | `timeout` | `float` | `300.0` | Per-request timeout in seconds |
+| `outbound` | `OutboundAdapter` \| `None` | auto | Custom outbound adapter; auto-resolved from `protocol` when omitted |
 | `auth_type` | `"bearer"` \| `"x-goog-api-key"` | — | **Deprecated:** Use `auth` instead |
 
 ### Authentication Configuration
@@ -138,7 +214,9 @@ The `auth` field supports multiple authentication modes:
 | `"none"` or `None` | No authentication headers added |
 | `callable` | Custom auth provider function for advanced scenarios |
 
-### Example: mixing Gemini and OpenAI
+### Example: a universal hub over Gemini, Bedrock, and DeepSeek
+
+This mirrors [`example/app.py`](example/app.py). One proxy fronts three providers; clients pick the provider by model name, regardless of which client protocol they speak.
 
 ```python
 import os
@@ -148,29 +226,48 @@ from gemini_calo.proxy import GeminiProxyService, RouteConfig
 app = FastAPI()
 
 proxy = GeminiProxyService(
-    base_url="https://generativelanguage.googleapis.com",
-    api_keys=["gemini-key-1", "gemini-key-2"],  # default: round-robined for unmatched models
+    api_keys=[os.environ["GEMINI_API_KEY"]],  # fallback for unmatched models
     model_routes={
-        # Glob pattern → RouteConfig
-        "gpt-4*": RouteConfig(
-            url="https://api.openai.com",
-            api_keys=["openai-key-1", "openai-key-2"],
+        # DeepSeek — a Chat-Completions-only OpenAI-compatible backend
+        "deepseek-*": RouteConfig(
+            url="https://api.deepseek.com",
+            api_keys=[os.environ["DEEPSEEK_API_KEY"]],
             auth="bearer",
+            protocol="openai-chat",
         ),
-        "claude-*": RouteConfig(
-            url="https://api.anthropic.com",
-            api_keys=["anthropic-key-1"],
+        # Gemini — translate every client protocol to the native Gemini API
+        "gemini-*": RouteConfig(
+            url="https://generativelanguage.googleapis.com",
+            api_keys=[os.environ["GEMINI_API_KEY"]],
+            auth="x-goog-api-key",
+            protocol="gemini",
+        ),
+        # Bedrock — Amazon Nova via the InvokeModel API (Bedrock API key)
+        "amazon.*": RouteConfig(
+            url="https://bedrock-runtime.us-east-1.amazonaws.com",
+            api_keys=[os.environ["BEDROCK_BEARER_TOKEN"]],
             auth="bearer",
-            timeout=600.0,
+            protocol="bedrock-invoke",
         ),
-        # Gemini requests not matched above use base_url + api_keys
+        # Colon-free alias for clients (e.g. zrb) that choke on ":" in model ids
+        "nova": RouteConfig(
+            url="https://bedrock-runtime.us-east-1.amazonaws.com",
+            api_keys=[os.environ["BEDROCK_BEARER_TOKEN"]],
+            auth="bearer",
+            protocol="bedrock-invoke",
+            upstream_model="amazon.nova-pro-v1:0",
+        ),
     },
 )
 
-app.include_router(proxy.gemini_router)
-app.include_router(proxy.openai_router)
-app.include_router(proxy.bedrock_router)
+# Expose every client protocol; each is served by whichever provider the model matches.
+app.include_router(proxy.openai_router)     # /v1/chat/completions, /v1/responses
+app.include_router(proxy.anthropic_router)  # /v1/messages
+app.include_router(proxy.gemini_router)     # native Gemini passthrough
+app.include_router(proxy.bedrock_router)    # native Bedrock passthrough
 ```
+
+With this running, an OpenAI client asking for `gemini-2.5-flash`, an Anthropic-Messages client (Claude Code) asking for `amazon.nova-pro-v1:0`, and a Responses client asking for `deepseek-chat` are all served correctly — each translated to its provider's native API. See [Client Integrations](#client-integrations) for the client side.
 
 Pattern matching uses Python's `fnmatch`, so `*` matches any substring within a segment and `?` matches a single character. Patterns are checked in insertion order — the first match wins.
 
@@ -358,7 +455,7 @@ Logs every incoming request and outgoing response, including headers and body. H
 
 ### Authentication Middleware (`auth_middleware`)
 
-Validates the proxy API key on all Gemini, OpenAI, and Bedrock requests. Accepts the key via `Authorization: Bearer <key>` or `x-goog-api-key` header. Returns `401` if the key is missing or invalid. Configured via `GEMINI_CALO_PROXY_API_KEYS`.
+Validates the proxy API key on all OpenAI, Anthropic, Gemini, and Bedrock requests. Accepts the key via `Authorization: Bearer <key>` or `x-goog-api-key` header. Returns `401` if the key is missing or invalid. Configured via `GEMINI_CALO_PROXY_API_KEYS`.
 
 ### Model Override Middleware (`model_override_middleware`)
 
@@ -445,99 +542,82 @@ app.middleware("http")(modify_request_middleware)
 # ... then add the Gemini Calo proxy and routers as shown above
 ```
 
-## Integration with Zrb
+## Client Integrations
 
-Suppose you run Gemini Calo with the following configuration, then you will have Gemini Calo run on `http://localhost:8080`.
+Every integration is the same shape: **point the client's base URL at Calo, give it any proxy key, and pick a model that a route matches.** Calo translates and forwards.
 
-```bash
-# Your gemini API Keys
-export GEMINI_CALO_API_KEYS=AIaYourGeminiKey1,AIaYourGeminiKey2
-# API Keys for your internal user
-export GEMINI_CALO_PROXY_API_KEYS=my_secret_proxy_key_1,my_secret_proxy_key_2
-# Gemini Calo HTTP Port
-export GEMINI_CALO_HTTP_PORT=8080
+The examples below assume the [universal hub](#example-a-universal-hub-over-gemini-bedrock-and-deepseek) running on `http://localhost:8000` with routes for `deepseek-*` (→ DeepSeek), `gemini-*` (→ Gemini), and `amazon.*` / `nova` (→ Bedrock). If `GEMINI_CALO_PROXY_API_KEYS` is unset, Calo accepts any key, so the tokens below can be any non-empty string. Ready-to-run configs for each client live in [`example/`](example/).
 
-# Start Gemini Calo
-gemini-calo
-```
+### OpenAI SDK (and any OpenAI-compatible client)
 
-### Integration Using OpenAI Compatibility Layer
-
-To use OpenAI compatibility layer with Zrb, you need to set some environment variables.
-
-```bash
-# OpenAI compatibility URL
-export ZRB_LLM_BASE_URL=http://localhost:8080/v1beta/openai/
-# One of your valid API Key for internal user
-export ZRB_LLM_API_KEY=my_secret_proxy_key_1
-# The model you want to use
-export ZRB_LLM_MODEL=gemini-2.5-flash
-
-# Run `zrb llm ask` or `zrb llm chat`
-zrb llm ask "What is the current weather at my current location?"
-```
-
-### Integration Using Gemini Endpoint
-
-To use Gemini Endpoint, you will need to edit or create `zrb_init.py`
+Point the OpenAI client at Calo's `/v1` base. The **same** client reaches every provider — just change the model:
 
 ```python
-from google import genai
-from google.genai.types import HttpOptions
-from pydantic_ai.models.gemini import GeminiModelSettings
-from pydantic_ai.providers.google import GoogleProvider
-from pydantic_ai.models.google import GoogleModel
-from zrb import llm_config
+from openai import OpenAI
 
-client = genai.Client(
-    api_key="my_secret_proxy_key_1",  # One of your valid API Key for internal user
-    http_options=HttpOptions(
-        base_url="http://localhost:8080",
-    ),
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="my_secret_proxy_key_1",  # any proxy key
 )
 
-provider = GoogleProvider(client=client)
-
-model = GoogleModel(
-    model_name="gemini-2.5-flash",
-    provider=provider,
-    settings=GeminiModelSettings(
-        temperature=0.0,
-        gemini_safety_settings=[
-            # Let's become evil 😈😈😈
-            # https://ai.google.dev/gemini-api/docs/safety-settings
-            {
-                "category": "HARM_CATEGORY_HARASSMENT",
-                "threshold": "BLOCK_NONE",
-            },
-            {
-                "category": "HARM_CATEGORY_HATE_SPEECH",
-                "threshold": "BLOCK_NONE",
-            },
-            {
-                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                "threshold": "BLOCK_NONE",
-            },
-            {
-                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                "threshold": "BLOCK_NONE",
-            },
-            {
-                "category": "HARM_CATEGORY_CIVIC_INTEGRITY",
-                "threshold": "BLOCK_NONE",
-            },
-        ]
+for model in ["gemini-2.5-flash", "deepseek-chat", "amazon.nova-pro-v1:0"]:
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": "Say hello in one word."}],
     )
-)
-llm_config.set_default_model(model)
+    print(model, "→", resp.choices[0].message.content)
 ```
 
-Once you set up everything, you can start interacting with Zrb.
+Tool/function calling and streaming work across providers; Calo normalizes provider-specific quirks so your client code stays unchanged.
+
+### Claude Code (Anthropic Messages)
+
+Claude Code speaks the Anthropic Messages API. Calo's `/v1/messages` endpoint (the `anthropic_router`) translates it to the routed provider, so you can run Claude Code against Gemini, Bedrock, or DeepSeek:
 
 ```bash
-# Run `zrb llm ask` or `zrb llm chat`
-zrb chat "What is the current weather at my current location?"
+export ANTHROPIC_BASE_URL="http://localhost:8000"
+export ANTHROPIC_AUTH_TOKEN="my_secret_proxy_key_1"      # any proxy key
+export ANTHROPIC_MODEL="amazon.nova-pro-v1:0"            # or gemini-2.5-pro, deepseek-chat
+export ANTHROPIC_SMALL_FAST_MODEL="amazon.nova-lite-v1:0"
+
+claude              # interactive
+claude -p "list the files in this repo"   # headless
 ```
+
+Make sure the proxy mounts `proxy.anthropic_router`. See [`example/claude-code.sh`](example/claude-code.sh) for a ready-to-source setup that leaves your global Claude Code config untouched.
+
+### zrb
+
+zrb's LLM uses an OpenAI-compatible client, so point it at Calo's `/v1` base and pick any routed model:
+
+```bash
+export ZRB_LLM_BASE_URL="http://localhost:8000/v1"
+export ZRB_LLM_API_KEY="my_secret_proxy_key_1"   # any proxy key
+export ZRB_LLM_MODEL="gemini-2.5-flash"          # or deepseek-chat, nova
+
+zrb llm ask "What is the current weather at my current location?"
+# interactive:  zrb llm chat
+```
+
+> **Note:** zrb parses a `:` in a model id as `provider:model`, so a Bedrock id like `amazon.nova-pro-v1:0` gets mangled. Use a colon-free route alias — the hub example maps `nova` → `amazon.nova-pro-v1:0` via `upstream_model`.
+
+See [`example/zrb-env.sh`](example/zrb-env.sh).
+
+### Other clients (codex, opencode)
+
+The [`example/`](example/) directory includes configs that never touch your global setup:
+
+| Client | Speaks | Setup | Run |
+|---|---|---|---|
+| codex | OpenAI Responses | `source example/codex-env.sh` (local `CODEX_HOME`, `wire_api = "responses"`) | `codex exec -m gemini-2.5-pro "…"` |
+| opencode | OpenAI-compatible | cwd [`example/opencode.json`](example/opencode.json) | `opencode run --model calo/<model> "…"` |
+
+### Native Gemini / Bedrock SDKs
+
+If a client already speaks a provider's native wire format, use the passthrough routes directly — set the SDK's base URL to Calo and it forwards with auth/logging/rollup applied:
+
+- **google-genai:** `genai.Client(api_key="my_secret_proxy_key_1", http_options=HttpOptions(base_url="http://localhost:8000"))` → hits `/v1beta/models/…`.
+- **boto3 `bedrock-runtime`:** point the endpoint at Calo → hits `/model/{modelId}/invoke` or `/converse`. See [AWS Bedrock Endpoint](#aws-bedrock-endpoint).
 
 ## Development & Testing
 

@@ -18,7 +18,11 @@ from gemini_calo.translate.ir import (
 )
 from gemini_calo.translate.outbound._bedrock_common import (
     BEDROCK_TO_IR_FINISH,
+    NOVA_MAX_TOKENS,
     bedrock_stream_feed,
+    bedrock_stream_flush,
+    is_nova_model,
+    raw_json_bodies,
     tool_calls_from_content,
 )
 
@@ -57,7 +61,13 @@ class BedrockConverseOutbound:
 
         inference: dict[str, Any] = {}
         if req.max_tokens is not None:
-            inference["maxTokens"] = req.max_tokens
+            # Converse is model-agnostic, but Nova still enforces its 10240 cap
+            # and rejects larger values; clamp only for Nova model ids.
+            inference["maxTokens"] = (
+                min(req.max_tokens, NOVA_MAX_TOKENS)
+                if is_nova_model(req.model)
+                else req.max_tokens
+            )
         if req.temperature is not None:
             inference["temperature"] = req.temperature
         if req.top_p is not None:
@@ -95,9 +105,9 @@ class BedrockConverseOutbound:
             return ChatResponse()
         resp = ChatResponse()
         content_blocks = data.get("output", {}).get("message", {}).get("content", [])
-        resp.content = " ".join(
+        resp.content = "".join(
             b.get("text", "") for b in content_blocks if isinstance(b, dict) and "text" in b
-        ).strip()
+        )
         resp.tool_calls = tool_calls_from_content(content_blocks)
         resp.finish_reason = (
             FINISH_TOOL_CALLS
@@ -117,9 +127,11 @@ class BedrockConverseOutbound:
             from botocore.eventstream import EventStreamBuffer
         except ImportError:
             async for chunk in chunks:
-                for body in _raw_json_bodies(chunk):
+                for body in raw_json_bodies(chunk):
                     for ev in bedrock_stream_feed(body, state):
                         yield ev
+            for ev in bedrock_stream_flush(state):
+                yield ev
             return
 
         buffer = EventStreamBuffer()
@@ -132,6 +144,8 @@ class BedrockConverseOutbound:
                     continue
                 for ev in bedrock_stream_feed(body, state):
                     yield ev
+        for ev in bedrock_stream_flush(state):
+            yield ev
 
 
 def _converse_tool_choice(tool_choice: Any) -> dict[str, Any] | None:
@@ -146,18 +160,3 @@ def _converse_tool_choice(tool_choice: Any) -> dict[str, Any] | None:
         if name:
             return {"tool": {"name": name}}
     return None
-
-
-def _raw_json_bodies(chunk: bytes) -> list[dict[str, Any]]:
-    bodies: list[dict[str, Any]] = []
-    for line in chunk.split(b"\n"):
-        line = line.strip()
-        if line.startswith(b"data: "):
-            line = line[6:]
-        if not line:
-            continue
-        try:
-            bodies.append(json.loads(line))
-        except (json.JSONDecodeError, ValueError):
-            continue
-    return bodies

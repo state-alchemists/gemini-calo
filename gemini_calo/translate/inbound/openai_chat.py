@@ -89,6 +89,34 @@ def copy_common_params(body: dict[str, Any], req: ChatRequest) -> None:
         req.tool_choice = body["tool_choice"]
 
 
+# Top-level OpenAI Chat keys the IR models explicitly; everything else is
+# preserved verbatim in ``ChatRequest.extra`` for OpenAI-compatible upstreams.
+_MODELLED_KEYS = frozenset(
+    {
+        "model",
+        "messages",
+        "temperature",
+        "top_p",
+        "stop",
+        "stream",
+        "tools",
+        "tool_choice",
+        "max_tokens",
+    }
+)
+
+
+def _collect_extra(body: dict[str, Any], req: ChatRequest) -> None:
+    """Preserve un-modelled OpenAI params (response_format, seed, penalties, ...).
+
+    Only meaningful when the upstream is itself OpenAI-compatible; the OpenAI
+    Chat outbound is the sole adapter that replays ``extra`` onto the wire.
+    """
+    for key, value in body.items():
+        if key not in _MODELLED_KEYS:
+            req.extra[key] = value
+
+
 class OpenAIChatInbound:
     """OpenAI Chat Completions <-> canonical IR."""
 
@@ -134,6 +162,7 @@ class OpenAIChatInbound:
             req.max_tokens = body["max_tokens"]
         copy_common_params(body, req)
         req.tools = parse_openai_tools(body)
+        _collect_extra(body, req)
         return req
 
     def render_response(self, resp: ChatResponse) -> bytes:
@@ -174,6 +203,9 @@ class OpenAIChatInbound:
         tool_index = 0
         finish_reason = FINISH_STOP
         saw_tool = False
+        saw_usage = False
+        prompt_tokens = 0
+        completion_tokens = 0
 
         def role_delta() -> bytes:
             return sse_data(
@@ -221,6 +253,10 @@ class OpenAIChatInbound:
                     }
                 )
                 tool_index += 1
+            elif ev.type == "usage":
+                saw_usage = True
+                prompt_tokens = ev.prompt_tokens or prompt_tokens
+                completion_tokens = ev.completion_tokens or completion_tokens
             elif ev.type == "finish":
                 finish_reason = ev.finish_reason or FINISH_STOP
 
@@ -229,6 +265,22 @@ class OpenAIChatInbound:
         yield openai_chat_sse_chunk(
             model=model, finish_reason=_IR_TO_OPENAI_FINISH.get(finish_reason, "stop"), completion_id=cid
         )
+        if saw_usage:
+            # Final usage-only chunk (empty choices), as OpenAI emits when
+            # stream_options.include_usage is set.
+            yield sse_data(
+                {
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    },
+                }
+            )
         yield openai_sse_done()
 
 

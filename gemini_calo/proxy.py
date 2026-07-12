@@ -166,18 +166,18 @@ class RouteConfig:
 
 
 class REQUEST_TYPE(Enum):
-    OPENAI_COMPLETION: str = "openai-completion"
-    OPENAI_RESPONSES: str = "openai-responses"
-    OPENAI_EMBEDDING: str = "openai-embedding"
-    GEMINI_COMPLETION: str = "gemini-completion"
-    GEMINI_STREAMING_COMPLETION: str = "gemini-streaming-completion"
-    GEMINI_EMBEDDING: str = "gemini-embedding"
-    BEDROCK_INVOKE: str = "bedrock-invoke"
-    BEDROCK_STREAMING_INVOKE: str = "bedrock-streaming-invoke"
-    BEDROCK_CONVERSE: str = "bedrock-converse"
-    BEDROCK_STREAMING_CONVERSE: str = "bedrock-streaming-converse"
-    ANTHROPIC_MESSAGES: str = "anthropic-messages"
-    OTHER: str = "other"
+    OPENAI_COMPLETION = "openai-completion"
+    OPENAI_RESPONSES = "openai-responses"
+    OPENAI_EMBEDDING = "openai-embedding"
+    GEMINI_COMPLETION = "gemini-completion"
+    GEMINI_STREAMING_COMPLETION = "gemini-streaming-completion"
+    GEMINI_EMBEDDING = "gemini-embedding"
+    BEDROCK_INVOKE = "bedrock-invoke"
+    BEDROCK_STREAMING_INVOKE = "bedrock-streaming-invoke"
+    BEDROCK_CONVERSE = "bedrock-converse"
+    BEDROCK_STREAMING_CONVERSE = "bedrock-streaming-converse"
+    ANTHROPIC_MESSAGES = "anthropic-messages"
+    OTHER = "other"
 
 
 # Maps a client request type to the inbound-adapter protocol name that parses it.
@@ -292,7 +292,7 @@ class GeminiProxyService:
         )
 
     @classmethod
-    def get_request_type(cls, request: Request) -> str:
+    def get_request_type(cls, request: Request) -> "REQUEST_TYPE":
         if request.url.path == "/v1/messages":
             return REQUEST_TYPE.ANTHROPIC_MESSAGES
         if request.url.path in (
@@ -363,7 +363,9 @@ class GeminiProxyService:
             try:
                 body = await request.body()
                 return json.loads(body).get("model")
-            except (json.JSONDecodeError, Exception):
+            except Exception:
+                # Best-effort: any failure reading/parsing the body means we
+                # can't extract a model name, so fall back to the default route.
                 return None
         elif request_type in (
             REQUEST_TYPE.BEDROCK_INVOKE,
@@ -473,16 +475,31 @@ class GeminiProxyService:
             response = await client.send(req, stream=is_streaming)
 
         if is_streaming:
+            # The client (created per request) must stay open until the stream
+            # is fully consumed, so close it in the iterator's finally block.
+            async def _iter_and_close():
+                try:
+                    async for chunk in response.aiter_raw():
+                        yield chunk
+                finally:
+                    await response.aclose()
+                    await client.aclose()
+
             return StreamingResponse(
-                response.aiter_raw(),
+                _iter_and_close(),
                 status_code=response.status_code,
                 headers=strip_compression_headers(dict(response.headers)),
             )
-        return Response(
-            content=response.content,
-            status_code=response.status_code,
-            headers=strip_compression_headers(dict(response.headers)),
-        )
+        try:
+            # Non-streaming send already read the full body; safe to close now.
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=strip_compression_headers(dict(response.headers)),
+            )
+        finally:
+            await response.aclose()
+            await client.aclose()
 
     @staticmethod
     async def _body_requests_streaming(request: Request) -> bool:

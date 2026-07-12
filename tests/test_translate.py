@@ -198,12 +198,94 @@ class TestOutboundRender:
         assert body["inferenceConfig"]["maxTokens"] == 256
         assert "anthropic_version" not in body
 
+    def test_bedrock_invoke_nova_stop_sequences(self):
+        req = ChatRequest(model="amazon.nova-pro-v1:0", messages=[Message.of_text("user", "hi")], stop=["STOP"])
+        body, _ = get_outbound_adapter("bedrock-invoke").render_request(req)
+        assert body["inferenceConfig"]["stopSequences"] == ["STOP"]
+
     def test_bedrock_converse_request(self):
         req = ChatRequest(model="m", system="sys", messages=[Message.of_text("user", "hi")], max_tokens=10)
         body, path = get_outbound_adapter("bedrock-converse").render_request(req)
         assert path == "/model/m/converse"
         assert body["system"] == [{"text": "sys"}]
         assert body["inferenceConfig"]["maxTokens"] == 10
+
+    def test_bedrock_converse_nova_max_tokens_capped(self):
+        """Nova enforces a 10240 output-token ceiling even over Converse."""
+        req = ChatRequest(model="amazon.nova-pro-v1:0", messages=[Message.of_text("user", "hi")], max_tokens=60000)
+        body, _ = get_outbound_adapter("bedrock-converse").render_request(req)
+        assert body["inferenceConfig"]["maxTokens"] == 10240
+
+    def test_bedrock_converse_non_nova_max_tokens_uncapped(self):
+        """Non-Nova models keep their requested max_tokens on the Converse path."""
+        req = ChatRequest(model="anthropic.claude-3-5-sonnet", messages=[Message.of_text("user", "hi")], max_tokens=60000)
+        body, _ = get_outbound_adapter("bedrock-converse").render_request(req)
+        assert body["inferenceConfig"]["maxTokens"] == 60000
+
+    def test_openai_chat_normalizes_anthropic_tool_choice(self):
+        """An Anthropic-style tool_choice must be mapped to OpenAI form, not
+        forwarded verbatim (which OpenAI-compatible upstreams reject)."""
+        adapter = get_outbound_adapter("openai-chat")
+        req = ChatRequest(model="m", messages=[Message.of_text("user", "hi")])
+
+        req.tool_choice = {"type": "auto"}
+        assert adapter.render_request(req)[0]["tool_choice"] == "auto"
+
+        req.tool_choice = {"type": "any"}
+        assert adapter.render_request(req)[0]["tool_choice"] == "required"
+
+        req.tool_choice = {"type": "tool", "name": "get_weather"}
+        assert adapter.render_request(req)[0]["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "get_weather"},
+        }
+
+    def test_openai_chat_passes_through_native_tool_choice(self):
+        """OpenAI-native tool_choice values are preserved unchanged."""
+        adapter = get_outbound_adapter("openai-chat")
+        req = ChatRequest(model="m", messages=[Message.of_text("user", "hi")])
+
+        req.tool_choice = "required"
+        assert adapter.render_request(req)[0]["tool_choice"] == "required"
+
+        native = {"type": "function", "function": {"name": "f"}}
+        req.tool_choice = native
+        assert adapter.render_request(req)[0]["tool_choice"] == native
+
+        # Responses-style flat object -> OpenAI nested function form.
+        req.tool_choice = {"type": "function", "name": "f"}
+        assert adapter.render_request(req)[0]["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "f"},
+        }
+
+    def test_openai_chat_passes_through_unmodelled_params(self):
+        """Params the IR doesn't model (JSON mode, seed, penalties, ...) must
+        survive an OpenAI-chat -> OpenAI-chat translation via ChatRequest.extra."""
+        inbound = get_inbound_adapter("openai-chat")
+        outbound = get_outbound_adapter("openai-chat")
+        req = inbound.parse_request(
+            {
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": "hi"}],
+                "temperature": 0.5,
+                "response_format": {"type": "json_object"},
+                "seed": 42,
+                "frequency_penalty": 0.3,
+            }
+        )
+        # Modelled param captured normally, not duplicated into extra.
+        assert req.temperature == 0.5
+        assert "temperature" not in req.extra
+        assert req.extra["seed"] == 42
+
+        body = outbound.render_request(req)[0]
+        assert body["response_format"] == {"type": "json_object"}
+        assert body["seed"] == 42
+        assert body["frequency_penalty"] == 0.3
+        # Modelled fields still win over anything replayed from extra.
+        assert body["temperature"] == 0.5
+        assert body["model"] == "deepseek-chat"
 
     def test_openai_chat_roundtrip_no_null_content(self):
         # A tool-only assistant turn must not serialise content: null.
@@ -500,6 +582,62 @@ class TestBedrockStreamParsing:
         events = self._feed([wrapped])
         assert [e.text for e in events if e.type == "text"] == ["hi"]
 
+    def test_converse_tool_stream_unwrapped(self):
+        """Regression: over the botocore EventStreamBuffer path the Converse
+        payload carries the block index *without* the enclosing event-type key,
+        so ``contentBlockStop`` is ``{"contentBlockIndex": N}``. The tool call
+        must still be emitted (flushed at the following messageStop)."""
+        events = self._feed(
+            [
+                {"role": "assistant"},  # messageStart payload
+                {"start": {"toolUse": {"toolUseId": "tu1", "name": "get_weather"}}, "contentBlockIndex": 0},
+                {"delta": {"toolUse": {"input": '{"city":'}}, "contentBlockIndex": 0},
+                {"delta": {"toolUse": {"input": '"SF"}'}}, "contentBlockIndex": 0},
+                {"contentBlockIndex": 0},  # contentBlockStop, no wrapper key
+                {"stopReason": "tool_use"},  # messageStop payload
+            ]
+        )
+        tcs = [e.tool_call for e in events if e.type == "tool_call"]
+        assert tcs and tcs[0].name == "get_weather" and tcs[0].arguments == {"city": "SF"}
+        # Tool call is emitted before the finish event.
+        types = [e.type for e in events]
+        assert types.index("tool_call") < types.index("finish")
+
+    def test_converse_two_tools_unwrapped(self):
+        """Two sequential tool blocks (unwrapped): the first flushes when the
+        second one starts, so both calls survive."""
+        events = self._feed(
+            [
+                {"start": {"toolUse": {"toolUseId": "a", "name": "f1"}}, "contentBlockIndex": 0},
+                {"delta": {"toolUse": {"input": '{"x":1}'}}, "contentBlockIndex": 0},
+                {"contentBlockIndex": 0},
+                {"start": {"toolUse": {"toolUseId": "b", "name": "f2"}}, "contentBlockIndex": 1},
+                {"delta": {"toolUse": {"input": '{"y":2}'}}, "contentBlockIndex": 1},
+                {"contentBlockIndex": 1},
+                {"stopReason": "tool_use"},
+            ]
+        )
+        tcs = [e.tool_call for e in events if e.type == "tool_call"]
+        assert [t.name for t in tcs] == ["f1", "f2"]
+        assert [t.arguments for t in tcs] == [{"x": 1}, {"y": 2}]
+
+    def test_converse_tool_stream_end_of_stream_flush(self):
+        """A tool block with no trailing messageStop is flushed at stream end."""
+        from gemini_calo.translate.outbound._bedrock_common import bedrock_stream_flush
+
+        state, events = {}, []
+        from gemini_calo.translate.outbound._bedrock_common import bedrock_stream_feed
+
+        for b in [
+            {"start": {"toolUse": {"toolUseId": "tu1", "name": "f"}}, "contentBlockIndex": 0},
+            {"delta": {"toolUse": {"input": '{"a":1}'}}, "contentBlockIndex": 0},
+            {"contentBlockIndex": 0},
+        ]:
+            events.extend(bedrock_stream_feed(b, state))
+        events.extend(bedrock_stream_flush(state))
+        tcs = [e.tool_call for e in events if e.type == "tool_call"]
+        assert tcs and tcs[0].name == "f" and tcs[0].arguments == {"a": 1}
+
 
 WEATHER_TOOL = {
     "type": "function",
@@ -546,7 +684,12 @@ class TestToolCalls:
 
     def test_tool_result_roundtrip_to_gemini(self, httpx_mock):
         """A follow-up request with an assistant tool_call + tool result encodes
-        to Gemini functionCall + functionResponse parts."""
+        to Gemini functionCall + functionResponse parts.
+
+        Real clients key tool results by an opaque call id (``call_...``), not
+        the function name. Gemini correlates results to calls *by name*, so the
+        adapter must resolve the id back to the originating function name.
+        """
         httpx_mock.add_response(
             url=f"{ALT}/v1beta/models/gemini-2.5-pro:generateContent",
             content=json.dumps({"candidates": [{"content": {"parts": [{"text": "It's sunny"}]}, "finishReason": "STOP"}]}),
@@ -562,10 +705,10 @@ class TestToolCalls:
                         "role": "assistant",
                         "content": None,
                         "tool_calls": [
-                            {"id": "get_weather", "type": "function", "function": {"name": "get_weather", "arguments": '{"city":"SF"}'}}
+                            {"id": "call_abc123", "type": "function", "function": {"name": "get_weather", "arguments": '{"city":"SF"}'}}
                         ],
                     },
-                    {"role": "tool", "tool_call_id": "get_weather", "content": '{"temp":72}'},
+                    {"role": "tool", "tool_call_id": "call_abc123", "content": '{"temp":72}'},
                 ],
             },
         )
@@ -574,6 +717,7 @@ class TestToolCalls:
         parts = [p for c in sent["contents"] for p in c["parts"]]
         assert any("functionCall" in p and p["functionCall"]["name"] == "get_weather" for p in parts)
         fr = [p["functionResponse"] for p in parts if "functionResponse" in p]
+        # The opaque id must be resolved back to the function name Gemini expects.
         assert fr and fr[0]["name"] == "get_weather"
         assert fr[0]["response"] == {"temp": 72}
 

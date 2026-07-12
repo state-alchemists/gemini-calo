@@ -101,7 +101,10 @@ class ChatRequest:
     stream: bool = False
     tools: list[ToolDef] = field(default_factory=list)
     tool_choice: Any | None = None
-    # Passthrough for provider-specific params we don't model explicitly.
+    # Passthrough for provider-specific params we don't model explicitly
+    # (e.g. response_format, seed, frequency_penalty). Only populated by, and
+    # applied by, the OpenAI-compatible adapters — where the leftover keys are
+    # valid on the wire as-is. Cross-protocol paths leave this empty.
     extra: dict[str, Any] = field(default_factory=dict)
 
 
