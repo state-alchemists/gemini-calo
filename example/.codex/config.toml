@@ -1,0 +1,6 @@
+# Codex CLI project config — Gemini Calo Hub
+#
+# NOTE: codex ignores `model_provider` from a project-local config, so the
+# provider MUST live in ~/.codex/config.toml. Run ../setup-codex.sh to install
+# it. This project file only overrides the default model (a supported key).
+model = "deepseek-chat"

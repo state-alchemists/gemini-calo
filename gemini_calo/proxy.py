@@ -51,12 +51,33 @@ class RouteConfig:
             - None: No authentication
         timeout: Request timeout in seconds.
         auth_type: DEPRECATED - Use auth instead. Kept for backward compatibility.
+        protocol: The upstream's native protocol format. Determines whether
+            request/response translation is applied.  Valid values:
+            - "openai" (default): OpenAI-compatible, no translation (pure
+              passthrough — use for real OpenAI, incl. its native /responses).
+            - "openai-chat": upstream speaks only /v1/chat/completions
+              (DeepSeek, Together, ...). Any client protocol is translated
+              through the canonical IR into chat completions.
+            - "gemini": Google Gemini native API.
+            - "bedrock-invoke": Bedrock InvokeModel API.
+            - "bedrock-converse": Bedrock Converse API.
+        upstream_model: Optional model id to send upstream instead of the one
+            the client requested. Lets you expose a friendly alias (e.g. route
+            key "nova" -> upstream_model "amazon.nova-pro-v1:0"), which also
+            works around clients that mangle model ids containing ":" (zrb).
+            Only applied on the translated path (non-"openai" protocol).
+        outbound: An OutboundAdapter for IR->upstream conversion.
+            Auto-resolved from *protocol* if not provided. ``None`` means
+            passthrough (protocol == "openai").
     """
 
     url: str
     api_keys: list[str] = field(default_factory=list)
     auth: AuthConfig = "bearer"
     timeout: float = 300.0
+    protocol: str = "openai"
+    upstream_model: str = ""  # if set, overrides the client's model id upstream
+    outbound: Any | None = None  # OutboundAdapter | None – Any avoids circular import
 
     # Deprecated field for backward compatibility
     auth_type: Literal["bearer", "x-goog-api-key"] | None = field(
@@ -84,6 +105,13 @@ class RouteConfig:
 
         # Convert preset strings to provider callables
         self._auth_provider = self._create_auth_provider()
+
+        # Auto-resolve the outbound adapter from protocol if not explicitly
+        # provided. protocol == "openai" means pure passthrough (no adapter).
+        if self.outbound is None and self.protocol != "openai":
+            from gemini_calo.translate import get_outbound_adapter
+
+            self.outbound = get_outbound_adapter(self.protocol)
 
     def _create_auth_provider(self) -> AuthProviderFunc:
         """Create the internal auth provider based on auth config."""
@@ -148,7 +176,16 @@ class REQUEST_TYPE(Enum):
     BEDROCK_STREAMING_INVOKE: str = "bedrock-streaming-invoke"
     BEDROCK_CONVERSE: str = "bedrock-converse"
     BEDROCK_STREAMING_CONVERSE: str = "bedrock-streaming-converse"
+    ANTHROPIC_MESSAGES: str = "anthropic-messages"
     OTHER: str = "other"
+
+
+# Maps a client request type to the inbound-adapter protocol name that parses it.
+_INBOUND_PROTOCOL: dict["REQUEST_TYPE", str] = {
+    REQUEST_TYPE.OPENAI_COMPLETION: "openai-chat",
+    REQUEST_TYPE.OPENAI_RESPONSES: "openai-responses",
+    REQUEST_TYPE.ANTHROPIC_MESSAGES: "anthropic-messages",
+}
 
 
 class GeminiProxyService:
@@ -165,6 +202,7 @@ class GeminiProxyService:
         self.openai_router = APIRouter()
         self.gemini_router = APIRouter()
         self.bedrock_router = APIRouter()
+        self.anthropic_router = APIRouter()
         self._add_routes()
 
     def _add_routes(self):
@@ -246,9 +284,17 @@ class GeminiProxyService:
             methods=["POST"],
             response_model=Any,
         )
+        self.anthropic_router.add_api_route(
+            "/v1/messages",
+            self.forward_anthropic_request,
+            methods=["POST"],
+            response_model=Any,
+        )
 
     @classmethod
     def get_request_type(cls, request: Request) -> str:
+        if request.url.path == "/v1/messages":
+            return REQUEST_TYPE.ANTHROPIC_MESSAGES
         if request.url.path in (
             "/v1/chat/completions",
             "/v1beta/openai/chat/completions",
@@ -312,6 +358,7 @@ class GeminiProxyService:
             REQUEST_TYPE.OPENAI_COMPLETION,
             REQUEST_TYPE.OPENAI_RESPONSES,
             REQUEST_TYPE.OPENAI_EMBEDDING,
+            REQUEST_TYPE.ANTHROPIC_MESSAGES,
         ):
             try:
                 body = await request.body()
@@ -345,9 +392,9 @@ class GeminiProxyService:
         self,
         request: Request,
         default_auth: Literal["bearer", "x-goog-api-key"] = "bearer",
-    ) -> tuple[httpx.AsyncClient, httpx.Auth | None, float]:
+    ) -> tuple[httpx.AsyncClient, httpx.Auth | None, float, RouteConfig | None]:
         """
-        Returns (client, auth, timeout) for the upstream request.
+        Returns (client, auth, timeout, route) for the upstream request.
 
         Checks model_routes first (glob-matched), falls back to base_url + api_keys.
         Auth is now an httpx.Auth instance that handles request signing.
@@ -364,7 +411,7 @@ class GeminiProxyService:
                 timeout=route.timeout,
             )
             auth = await route.get_auth(request)
-            return client, auth, route.timeout
+            return client, auth, route.timeout, route
 
         # Default route - use legacy auth for backward compatibility
         client = create_http_client(
@@ -383,7 +430,7 @@ class GeminiProxyService:
         else:
             auth = None
 
-        return client, auth, 300.0
+        return client, auth, 300.0, None
 
     async def _send_upstream(
         self,
@@ -394,16 +441,25 @@ class GeminiProxyService:
         timeout: float,
         is_streaming: bool,
         path: str | None = None,
+        body_override: bytes | None = None,
     ) -> Response:
         """Build, send, and wrap the upstream request. Shared by all forwarders."""
-        url = httpx.URL(
-            path=path or request.url.path, query=request.url.query.encode("utf-8")
+        # A translated path may carry its own query string (e.g. Gemini's
+        # ?alt=sse); split it out and prefer it over the client's query.
+        target_path = path or request.url.path
+        target_path, _, target_query = target_path.partition("?")
+        query = (
+            target_query.encode("utf-8")
+            if target_query
+            else request.url.query.encode("utf-8")
         )
-        content = (
-            request.state.modified_body
-            if hasattr(request.state, "modified_body")
-            else request.stream()
-        )
+        url = httpx.URL(path=target_path, query=query)
+        if body_override is not None:
+            content = body_override
+        elif hasattr(request.state, "modified_body"):
+            content = request.state.modified_body
+        else:
+            content = request.stream()
         req = client.build_request(
             request.method,
             url,
@@ -442,25 +498,58 @@ class GeminiProxyService:
             return False
 
     async def forward_openai_request(self, request: Request) -> Response:
-        """Forward openai request"""
-        client, auth, timeout = await self._resolve_upstream(request, "bearer")
-        path = request.url.path
+        """Forward an OpenAI Chat Completions / Responses / Embeddings request.
 
-        # Map standard OpenAI paths to Gemini-OpenAI paths only if target is Google
-        is_google = str(client.base_url).startswith(
+        Embeddings are always passed through. Chat/Responses are translated
+        through the canonical IR when the matched route declares a non-OpenAI
+        upstream protocol; otherwise they pass through (with Google path
+        mapping) exactly as before.
+        """
+        request_type = self.get_request_type(request)
+        client, auth, timeout, route = await self._resolve_upstream(request, "bearer")
+
+        inbound_protocol = _INBOUND_PROTOCOL.get(request_type)
+        if route and route.outbound is not None and inbound_protocol is not None:
+            return await self._forward_translated(
+                request, client, auth, timeout, route, inbound_protocol
+            )
+        return await self._forward_openai_passthrough(request, client, auth, timeout)
+
+    async def forward_anthropic_request(self, request: Request) -> Response:
+        """Forward an Anthropic Messages (/v1/messages) request.
+
+        Requires a matched route with a translating protocol, because no
+        upstream here speaks Anthropic Messages natively.
+        """
+        client, auth, timeout, route = await self._resolve_upstream(request, "bearer")
+        if route and route.outbound is not None:
+            return await self._forward_translated(
+                request, client, auth, timeout, route, "anthropic-messages"
+            )
+        # No translating route matched — pass through so a misconfiguration
+        # surfaces as the upstream's own error rather than a silent hang.
+        return await self._forward_openai_passthrough(request, client, auth, timeout)
+
+    async def _forward_openai_passthrough(
+        self,
+        request: Request,
+        client: httpx.AsyncClient,
+        auth: httpx.Auth | None,
+        timeout: float,
+    ) -> Response:
+        """Legacy passthrough: forward the OpenAI body verbatim (no IR)."""
+        path = request.url.path
+        # Map standard OpenAI paths to Gemini-OpenAI paths only if target is Google.
+        if str(client.base_url).startswith(
             "https://generativelanguage.googleapis.com"
-        )
-        if is_google:
+        ):
             if path == "/v1/chat/completions":
                 path = "/v1beta/openai/chat/completions"
             elif path == "/v1/embeddings":
                 path = "/v1beta/openai/embeddings"
 
         logger.info(f"Forwarding OpenAI request to: {path}")
-
-        # OpenAI-style requests carry "stream": true in the body
         is_streaming = await self._body_requests_streaming(request)
-
         return await self._send_upstream(
             request,
             client,
@@ -469,6 +558,77 @@ class GeminiProxyService:
             timeout=timeout,
             is_streaming=is_streaming,
             path=path,
+        )
+
+    async def _forward_translated(
+        self,
+        request: Request,
+        client: httpx.AsyncClient,
+        auth: httpx.Auth | None,
+        timeout: float,
+        route: RouteConfig,
+        inbound_protocol: str,
+    ) -> Response:
+        """Client protocol -> IR -> upstream protocol, then reverse the response."""
+        from gemini_calo.translate import get_inbound_adapter
+
+        raw_body = (
+            request.state.modified_body
+            if hasattr(request.state, "modified_body")
+            else await request.body()
+        )
+        try:
+            body = json.loads(raw_body)
+        except (json.JSONDecodeError, ValueError):
+            body = {}
+
+        inbound = get_inbound_adapter(inbound_protocol)
+        outbound = route.outbound
+
+        ir_req = inbound.parse_request(body)
+        if route.upstream_model:
+            ir_req.model = route.upstream_model
+        up_body, up_path = outbound.render_request(ir_req)
+        is_streaming = ir_req.stream
+
+        logger.info(
+            f"Translating {inbound_protocol} -> {route.protocol}: {up_path} "
+            f"(stream={is_streaming})"
+        )
+
+        response = await self._send_upstream(
+            request,
+            client,
+            auth,
+            headers={"Content-Type": "application/json"},
+            timeout=timeout,
+            is_streaming=is_streaming,
+            path=up_path,
+            body_override=json.dumps(up_body).encode(),
+        )
+
+        # On upstream error, return the raw error body untouched so the real
+        # status/message reaches the client instead of an empty translation.
+        if response.status_code >= 400:
+            return response
+
+        if is_streaming:
+            events = outbound.parse_stream(response.body_iterator)
+            return StreamingResponse(
+                inbound.render_stream(events, ir_req.model),
+                status_code=response.status_code,
+                media_type="text/event-stream",
+            )
+
+        ir_resp = outbound.parse_response(
+            response.body, response.headers.get("content-type", "")
+        )
+        if not ir_resp.model:
+            ir_resp.model = ir_req.model
+        return Response(
+            content=inbound.render_response(ir_resp),
+            status_code=response.status_code,
+            media_type="application/json",
         )
 
     async def _resolve_bedrock_upstream(
@@ -501,7 +661,9 @@ class GeminiProxyService:
 
     async def forward_gemini_request(self, request: Request) -> Response:
         """Forward gemini request"""
-        client, auth, timeout = await self._resolve_upstream(request, "x-goog-api-key")
+        client, auth, timeout, _route = await self._resolve_upstream(
+            request, "x-goog-api-key"
+        )
 
         logger.info(f"Forwarding Gemini request to: {request.url.path}")
 

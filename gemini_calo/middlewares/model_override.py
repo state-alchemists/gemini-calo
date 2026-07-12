@@ -45,7 +45,9 @@ async def model_override_middleware(
     if request_type in [
         REQUEST_TYPE.OPENAI_COMPLETION,
         REQUEST_TYPE.OPENAI_RESPONSES,
+        REQUEST_TYPE.ANTHROPIC_MESSAGES,
     ]:
+        # All three carry the model as a top-level body field.
         request = await _transform_model_in_openai_request(request, transformer)
     elif request_type in [
         REQUEST_TYPE.GEMINI_COMPLETION,

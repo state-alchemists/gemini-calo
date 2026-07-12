@@ -28,6 +28,7 @@ def start_server():
     app.include_router(proxy.gemini_router)
     app.include_router(proxy.openai_router)
     app.include_router(proxy.bedrock_router)
+    app.include_router(proxy.anthropic_router)
 
     @app.get("/")
     def read_root():

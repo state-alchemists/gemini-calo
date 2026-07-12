@@ -541,58 +541,93 @@ zrb chat "What is the current weather at my current location?"
 
 ## Development & Testing
 
-### Running Tests
+Calo translates between many client protocols and many upstream providers, so
+testing happens in **three layers**. Each catches what the layer below cannot:
 
-Clone the repository and install development dependencies:
+| Layer | What it runs | Catches | Needs |
+|-------|--------------|---------|-------|
+| 1. Unit / integration | `pytest` (mocked upstreams) | translation logic, routing, middleware | dev deps |
+| 2. Live smoke | `example/smoke_test.py` (real providers) | token caps, tool-schema keywords, streaming framing | real API keys |
+| 3. End-to-end clients | `claude` / `opencode` / `codex` / `zrb` headless | the *actual* payloads each client sends, full agentic tool loops | keys + clients installed |
+
+> ⚠️ **Layer 1 alone is not enough.** Mocked tests pass with toy inputs but miss
+> real constraints (e.g. Nova's 10240 `max_tokens` cap, Gemini rejecting
+> `$schema`/`exclusiveMinimum`, codex requiring `wire_api = "responses"`). After
+> any change to the `translate/` layer, run layers 2 and 3.
+
+### Run everything at once
+
+```bash
+cd example
+cp ../template.env .env   # then fill in real keys (or reuse .env)
+./test-all.sh             # layers 1–3, all clients × all providers
+./test-all.sh gemini-2.5-flash   # limit to specific model(s)
+```
+
+`test-all.sh` runs pytest, starts the hub, runs the live smoke test, then drives
+every installed client against each provider with a real tool-using task, and
+exits non-zero if anything fails. It touches **no global client config**
+(see the per-client setup below).
+
+### Layer 1 — Unit & integration tests
 
 ```bash
 git clone https://github.com/state-alchemists/gemini-calo.git
 cd gemini-calo
 pip install -e ".[dev]"
+
+python -m pytest                                   # all tests
+python -m pytest tests/test_translate.py -v        # the IR translation layer
+python -m pytest --cov=gemini_calo --cov-report=term-missing
 ```
 
-Run the test suite:
+### Layer 2 — Live smoke test (real providers)
+
+Start the hub, then hit every endpoint/model with **realistic** payloads
+(large `max_tokens`, rich JSON-Schema tools, streaming):
 
 ```bash
-# Run all tests
-python -m pytest tests/ -v
-
-# Run specific test file
-python -m pytest tests/test_auth_providers.py -v
-
-# Run specific test
-python -m pytest tests/test_auth_providers.py::test_create_bearer_provider_rotates_keys -v
+cd example && source .env && python app.py    # terminal 1
+python example/smoke_test.py                  # terminal 2 (all models)
+python example/smoke_test.py amazon.nova-pro-v1:0   # a single model
 ```
 
-### Code Coverage
+### Layer 3 — End-to-end with the real clients (ground truth)
 
-Run tests with coverage report:
+Each client is pointed at Calo using **local/env config only — your global
+config is never modified**:
 
-```bash
-# Run with coverage
-python -m pytest tests/ --cov=gemini_calo --cov-report=term-missing
+| Client | How it's configured | Headless command |
+|--------|---------------------|------------------|
+| Claude Code | env vars (`source example/claude-code.sh`) | `claude -p "…"` |
+| opencode | cwd `opencode.json` with an inlined key | `opencode run --model calo/<model> "…"` |
+| codex | local `CODEX_HOME` (`source example/codex-env.sh`) | `codex exec -m <model> "…"` |
+| zrb | env vars (`source example/zrb-env.sh`) | `zrb llm chat --interactive false --message "…"` |
 
-# Generate HTML coverage report
-python -m pytest tests/ --cov=gemini_calo --cov-report=html
-open htmlcov/index.html
-```
+Choosing a model per client: set `ANTHROPIC_MODEL` (Claude Code), `--model
+calo/<model>` (opencode), `-m <model>` (codex), or `ZRB_LLM_MODEL` (zrb) to any
+of `deepseek-chat`, `gemini-2.5-pro`/`gemini-2.5-flash`, `amazon.nova-pro-v1:0`.
 
-Current coverage: **~82%**
+### Provider constraints the tests guard
 
-### Optional Dependencies
+If you add a provider or model, verify these — they are the things that broke in
+practice and are now covered:
 
-For AWS SigV4 authentication tests, install `botocore`:
-
-```bash
-pip install botocore
-```
-
-Tests that require `botocore` are automatically skipped if it's not installed.
+- **Nova** caps output at **10240** `max_tokens` (Calo clamps it).
+- **Gemini** function schemas accept only a Schema subset — `$schema`,
+  `additionalProperties`, `exclusiveMinimum`, … are stripped by Calo.
+- **codex** ≥ 0.144 requires `wire_api = "responses"` (not `"chat"`).
+- **zrb** treats `:` in a model id as `provider:model`; use a colon-free alias
+  (the example maps `nova` → `amazon.nova-pro-v1:0` via `upstream_model`).
+- **Bedrock streaming** uses AWS binary event-stream framing — requires
+  `botocore` (a hard dependency, installed with the package).
 
 ### Test Structure
 
 | File | Purpose |
 |------|---------|
+| `test_translate.py` | IR translation: inbound/outbound adapters, tool calls, streaming, real-client quirks |
+| `test_responses.py` | `/v1/responses` handling |
 | `test_auth.py` | Proxy authentication middleware tests |
 | `test_auth_providers.py` | Auth module tests (Bearer, XGoog, AWS SigV4) |
 | `test_bedrock.py` | Bedrock endpoint, auth providers, model override, and rollup tests |
