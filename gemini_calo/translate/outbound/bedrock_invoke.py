@@ -21,7 +21,10 @@ from gemini_calo.translate.ir import (
 )
 from gemini_calo.translate.outbound._bedrock_common import (
     BEDROCK_TO_IR_FINISH,
+    NOVA_MAX_TOKENS,
     bedrock_stream_feed,
+    bedrock_stream_flush,
+    raw_json_bodies,
     tool_calls_from_content,
 )
 
@@ -62,9 +65,11 @@ class BedrockInvokeOutbound:
             from botocore.eventstream import EventStreamBuffer
         except ImportError:
             async for chunk in chunks:
-                for body in _raw_json_bodies(chunk):
+                for body in raw_json_bodies(chunk):
                     for ev in bedrock_stream_feed(body, state):
                         yield ev
+            for ev in bedrock_stream_flush(state):
+                yield ev
             return
 
         buffer = EventStreamBuffer()
@@ -77,6 +82,8 @@ class BedrockInvokeOutbound:
                     continue
                 for ev in bedrock_stream_feed(body, state):
                     yield ev
+        for ev in bedrock_stream_flush(state):
+            yield ev
 
 
 # -- Anthropic-format body --
@@ -150,11 +157,6 @@ def _anthropic_tool_choice(tool_choice: Any) -> dict[str, Any] | None:
 
 # -- Nova-format body (Converse schema) --
 
-# Amazon Nova caps generation at 10240 output tokens; clients routinely ask for
-# more (Claude Code/opencode send tens of thousands), which Nova rejects with
-# "maxTokens must be between 1 and 10240".
-NOVA_MAX_TOKENS = 10240
-
 
 def _nova_body(req: ChatRequest) -> dict[str, Any]:
     body: dict[str, Any] = {"messages": _nova_messages(req)}
@@ -167,6 +169,8 @@ def _nova_body(req: ChatRequest) -> dict[str, Any]:
         inference["temperature"] = req.temperature
     if req.top_p is not None:
         inference["topP"] = req.top_p
+    if req.stop:
+        inference["stopSequences"] = req.stop
     if inference:
         body["inferenceConfig"] = inference
     if req.tools:
@@ -235,9 +239,9 @@ def _bedrock_to_ir(data: dict[str, Any]) -> ChatResponse:
     content_blocks = data.get("content", [])
     if not content_blocks:
         content_blocks = data.get("output", {}).get("message", {}).get("content", [])
-    resp.content = " ".join(
+    resp.content = "".join(
         b.get("text", "") for b in content_blocks if isinstance(b, dict) and "text" in b
-    ).strip()
+    )
     resp.tool_calls = tool_calls_from_content(content_blocks)
 
     stop_reason = data.get("stop_reason") or data.get("stopReason", "end_turn")
@@ -249,18 +253,3 @@ def _bedrock_to_ir(data: dict[str, Any]) -> ChatResponse:
     resp.prompt_tokens = usage.get("input_tokens") or usage.get("inputTokens", 0)
     resp.completion_tokens = usage.get("output_tokens") or usage.get("outputTokens", 0)
     return resp
-
-
-def _raw_json_bodies(chunk: bytes) -> list[dict[str, Any]]:
-    bodies: list[dict[str, Any]] = []
-    for line in chunk.split(b"\n"):
-        line = line.strip()
-        if line.startswith(b"data: "):
-            line = line[6:]
-        if not line:
-            continue
-        try:
-            bodies.append(json.loads(line))
-        except (json.JSONDecodeError, ValueError):
-            continue
-    return bodies

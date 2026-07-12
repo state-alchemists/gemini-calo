@@ -252,6 +252,12 @@ class AnthropicMessagesInbound:
 
         if saw_tool and stop_reason == FINISH_STOP:
             stop_reason = FINISH_TOOL_CALLS
+        # Upstream usage typically arrives at the end of the stream, so
+        # message_start could only report input_tokens=0. Surface the real
+        # prompt-token count here alongside the output count.
+        usage: dict[str, Any] = {"output_tokens": completion_tokens}
+        if prompt_tokens:
+            usage["input_tokens"] = prompt_tokens
         yield sse_event(
             "message_delta",
             {
@@ -260,7 +266,7 @@ class AnthropicMessagesInbound:
                     "stop_reason": _IR_TO_ANTHROPIC_STOP.get(stop_reason, "end_turn"),
                     "stop_sequence": None,
                 },
-                "usage": {"output_tokens": completion_tokens},
+                "usage": usage,
             },
         )
         yield sse_event("message_stop", {"type": "message_stop"})

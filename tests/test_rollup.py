@@ -27,6 +27,7 @@ def client(request):
 
     app.include_router(proxy.gemini_router)
     app.include_router(proxy.openai_router)
+    app.include_router(proxy.anthropic_router)
     return TestClient(app), lru_cache
 
 
@@ -192,3 +193,98 @@ def test_openai_completion_in_cache(client, httpx_mock):
     request = httpx_mock.get_requests()[1]
     request_body = json.loads(request.content)
     assert request_body["messages"][0]["role"] == "system"
+
+
+def test_anthropic_messages_in_cache(client, httpx_mock):
+    client, _ = client
+    assistant_turn = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "I am doing well."}],
+    }
+    httpx_mock.add_response(
+        url=f"{BASE_URL}/v1/messages",
+        content=json.dumps(
+            {"role": "assistant", "content": assistant_turn["content"]}
+        ),
+        status_code=200,
+    )
+
+    # First request populates the cache with [user, assistant].
+    client.post(
+        "/v1/messages",
+        json={"messages": [{"role": "user", "content": "Hello"}]},
+    )
+
+    mock_response_2 = json.dumps(
+        {"role": "assistant", "content": [{"type": "text", "text": "I am a model."}]}
+    )
+    httpx_mock.add_response(
+        url=f"{BASE_URL}/v1/messages", content=mock_response_2, status_code=200
+    )
+
+    # Second request replays the same prefix plus a new user turn.
+    response = client.post(
+        "/v1/messages",
+        json={
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                assistant_turn,
+                {"role": "user", "content": "How are you?"},
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(httpx_mock.get_requests()) == 2
+    sent = json.loads(httpx_mock.get_requests()[1].content)
+    # System (the rolled-up summary) is injected, and the matched prefix is
+    # trimmed off so only the new user turn remains.
+    assert "system" in sent and sent["system"]
+    assert sent["messages"] == [{"role": "user", "content": "How are you?"}]
+
+
+def test_openai_responses_in_cache(client, httpx_mock):
+    client, _ = client
+    user_turn = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "Hello"}],
+    }
+    assistant_output = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "I am doing well."}],
+        }
+    ]
+    httpx_mock.add_response(
+        url=f"{BASE_URL}/v1/responses",
+        content=json.dumps({"output": assistant_output}),
+        status_code=200,
+    )
+
+    # First request populates the cache with [user] + output items.
+    client.post("/v1/responses", json={"input": [user_turn]})
+
+    httpx_mock.add_response(
+        url=f"{BASE_URL}/v1/responses",
+        content=json.dumps({"output": []}),
+        status_code=200,
+    )
+
+    new_user_turn = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "How are you?"}],
+    }
+    response = client.post(
+        "/v1/responses",
+        json={"input": [user_turn, *assistant_output, new_user_turn]},
+    )
+
+    assert response.status_code == 200
+    assert len(httpx_mock.get_requests()) == 2
+    sent = json.loads(httpx_mock.get_requests()[1].content)
+    # Summary injected via "instructions"; matched prefix trimmed from "input".
+    assert "instructions" in sent and sent["instructions"]
+    assert sent["input"] == [new_user_turn]

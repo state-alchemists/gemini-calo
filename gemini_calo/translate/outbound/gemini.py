@@ -29,6 +29,17 @@ class GeminiOutbound:
     """Canonical IR <-> Gemini generateContent API."""
 
     def render_request(self, req: ChatRequest) -> tuple[dict[str, Any], str]:
+        # Gemini correlates a functionResponse to its functionCall *by function
+        # name*, but every inbound client (OpenAI, Anthropic, Responses) keys
+        # tool results by an opaque call id. Build an id -> name map from the
+        # assistant tool calls so results resolve back to the right name.
+        id_to_name = {
+            tc.id: tc.name
+            for m in req.messages
+            for tc in m.tool_calls
+            if tc.id
+        }
+
         contents: list[dict[str, Any]] = []
         for m in req.messages:
             if m.role == "tool":
@@ -38,10 +49,9 @@ class GeminiOutbound:
                         "parts": [
                             {
                                 "functionResponse": {
-                                    # Gemini matches results to calls by function
-                                    # name; our IR uses name as the tool_call id
-                                    # for Gemini so this round-trips.
-                                    "name": tr.tool_call_id,
+                                    "name": id_to_name.get(
+                                        tr.tool_call_id, tr.tool_call_id
+                                    ),
                                     "response": _wrap_result(tr.content),
                                 }
                             }
@@ -105,23 +115,32 @@ class GeminiOutbound:
         # a JSON array. Handle SSE lines and bare JSON objects line-by-line.
         buffer = b""
         finish_emitted = False
+
+        def parse_line(raw: bytes) -> list[StreamEvent]:
+            raw = raw.strip().lstrip(b"[,").rstrip(b",]")
+            if not raw:
+                return []
+            if raw.startswith(b"data: "):
+                raw = raw[6:]
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                return []
+            return _gemini_chunk_to_events(data)
+
         async for chunk in chunks:
             buffer += chunk
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
-                line = line.strip().lstrip(b"[,").rstrip(b",]")
-                if not line:
-                    continue
-                if line.startswith(b"data: "):
-                    line = line[6:]
-                try:
-                    data = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                for ev in _gemini_chunk_to_events(data):
+                for ev in parse_line(line):
                     if ev.type == "finish":
                         finish_emitted = True
                     yield ev
+        # Process any final event not terminated by a newline.
+        for ev in parse_line(buffer):
+            if ev.type == "finish":
+                finish_emitted = True
+            yield ev
         if not finish_emitted:
             yield StreamEvent(type="finish", finish_reason=FINISH_STOP)
 
@@ -168,7 +187,6 @@ def _sanitize_gemini_schema(schema: Any) -> Any:
             out["anyOf"] = [_sanitize_gemini_schema(v) for v in value]
         else:
             out[key] = value
-    # Gemini requires OBJECT schemas to declare a (possibly empty) type.
     return out
 
 

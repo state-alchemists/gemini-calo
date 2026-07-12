@@ -63,6 +63,10 @@ class OpenAIChatOutbound:
             messages.append(msg)
 
         body: dict[str, Any] = {"model": req.model, "messages": messages}
+        # Replay client params we don't model (JSON mode, seed, penalties, ...)
+        # as a base; the modelled fields below override on any key collision.
+        if req.extra:
+            body.update(req.extra)
         if req.max_tokens is not None:
             body["max_tokens"] = req.max_tokens
         if req.temperature is not None:
@@ -86,9 +90,9 @@ class OpenAIChatOutbound:
                 }
                 for t in req.tools
             ]
-        if req.tool_choice is not None:
-            body["tool_choice"] = req.tool_choice
-        body.update(req.extra)
+        tc = _openai_tool_choice(req.tool_choice)
+        if tc is not None:
+            body["tool_choice"] = tc
         return body, "/v1/chat/completions"
 
     def parse_response(self, body: bytes, content_type: str) -> ChatResponse:
@@ -133,57 +137,109 @@ class OpenAIChatOutbound:
             pending.clear()
             return events
 
-        async for chunk in chunks:
-            buffer += chunk
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                line = line.strip()
-                if not line or line.startswith(b":") or not line.startswith(b"data: "):
-                    continue
-                payload = line[6:]
-                if payload == b"[DONE]":
-                    for ev in flush_tools():
-                        yield ev
-                    return
-                try:
-                    data = json.loads(payload)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                usage = data.get("usage")
-                if usage:
-                    yield StreamEvent(
+        def parse_line(line: bytes) -> tuple[list[StreamEvent], bool]:
+            """Return (events, done); ``done`` is True on the ``[DONE]`` sentinel."""
+            events: list[StreamEvent] = []
+            line = line.strip()
+            if not line or line.startswith(b":") or not line.startswith(b"data: "):
+                return events, False
+            payload = line[6:]
+            if payload == b"[DONE]":
+                events.extend(flush_tools())
+                return events, True
+            try:
+                data = json.loads(payload)
+            except (json.JSONDecodeError, ValueError):
+                return events, False
+            usage = data.get("usage")
+            if usage:
+                events.append(
+                    StreamEvent(
                         type="usage",
                         prompt_tokens=usage.get("prompt_tokens", 0),
                         completion_tokens=usage.get("completion_tokens", 0),
                     )
-                choice = (data.get("choices") or [{}])
-                if not choice:
-                    continue
-                choice = choice[0]
-                delta = choice.get("delta", {})
-                text = delta.get("content")
-                if text:
-                    yield StreamEvent(type="text", text=text)
-                for tc in delta.get("tool_calls", []) or []:
-                    idx = tc.get("index", 0)
-                    slot = pending.setdefault(idx, {"id": "", "name": "", "args": ""})
-                    if tc.get("id"):
-                        slot["id"] = tc["id"]
-                    fn = tc.get("function", {})
-                    if fn.get("name"):
-                        slot["name"] = fn["name"]
-                    if fn.get("arguments"):
-                        slot["args"] += fn["arguments"]
-                fr = choice.get("finish_reason")
-                if fr:
-                    for ev in flush_tools():
-                        yield ev
-                    yield StreamEvent(
+                )
+            choice = (data.get("choices") or [{}])
+            if not choice:
+                return events, False
+            choice = choice[0]
+            delta = choice.get("delta", {})
+            text = delta.get("content")
+            if text:
+                events.append(StreamEvent(type="text", text=text))
+            for tc in delta.get("tool_calls", []) or []:
+                idx = tc.get("index", 0)
+                slot = pending.setdefault(idx, {"id": "", "name": "", "args": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function", {})
+                if fn.get("name"):
+                    slot["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["args"] += fn["arguments"]
+            fr = choice.get("finish_reason")
+            if fr:
+                events.extend(flush_tools())
+                events.append(
+                    StreamEvent(
                         type="finish",
                         finish_reason=_OPENAI_TO_IR_FINISH.get(fr, FINISH_STOP),
                     )
+                )
+            return events, False
+
+        async for chunk in chunks:
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                events, done = parse_line(line)
+                for ev in events:
+                    yield ev
+                if done:
+                    return
+        # Process any final event not terminated by a newline.
+        events, done = parse_line(buffer)
+        for ev in events:
+            yield ev
+        if done:
+            return
         for ev in flush_tools():
             yield ev
+
+
+def _openai_tool_choice(tool_choice: Any) -> Any | None:
+    """Normalise a client-supplied ``tool_choice`` into OpenAI Chat form.
+
+    The IR keeps ``tool_choice`` as the raw client value, which may be an
+    OpenAI string ("auto"/"none"/"required"), an OpenAI object
+    (``{"type":"function","function":{"name":...}}``), an Anthropic object
+    (``{"type":"auto"|"any"|"tool","name":...}``) or a Responses object
+    (``{"type":"function","name":...}``). Forwarding a non-OpenAI shape makes
+    OpenAI-compatible upstreams reject the request, so map them all here.
+    """
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        return "required" if tool_choice == "any" else tool_choice
+    if isinstance(tool_choice, dict):
+        # Already OpenAI-native: {"type":"function","function":{"name":...}}
+        if tool_choice.get("type") == "function" and isinstance(
+            tool_choice.get("function"), dict
+        ):
+            return tool_choice
+        ttype = tool_choice.get("type")
+        if ttype == "auto":
+            return "auto"
+        if ttype == "none":
+            return "none"
+        if ttype in ("any", "required"):
+            return "required"
+        # Anthropic {"type":"tool","name":...} or Responses {"type":"function","name":...}
+        name = tool_choice.get("name") or tool_choice.get("function", {}).get("name")
+        if name:
+            return {"type": "function", "function": {"name": name}}
+    return "auto"
 
 
 def _assemble(slot: dict[str, Any]) -> ToolCall:

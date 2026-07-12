@@ -29,6 +29,33 @@ BEDROCK_TO_IR_FINISH = {
     "tool_use": FINISH_TOOL_CALLS,
 }
 
+# Amazon Nova caps generation at 10240 output tokens; clients routinely ask for
+# more (Claude Code / opencode send tens of thousands), which Nova rejects with
+# "maxTokens must be between 1 and 10240". Both the InvokeModel and Converse
+# adapters clamp Nova requests to this ceiling.
+NOVA_MAX_TOKENS = 10240
+
+
+def is_nova_model(model: str) -> bool:
+    """True for Amazon Nova model ids (the only family with the 10240 cap)."""
+    return "nova" in model.lower()
+
+
+def raw_json_bodies(chunk: bytes) -> list[dict[str, Any]]:
+    """Best-effort NDJSON/SSE fallback used when botocore is unavailable."""
+    bodies: list[dict[str, Any]] = []
+    for line in chunk.split(b"\n"):
+        line = line.strip()
+        if line.startswith(b"data: "):
+            line = line[6:]
+        if not line:
+            continue
+        try:
+            bodies.append(json.loads(line))
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return bodies
+
 
 def tool_calls_from_content(content_blocks: list[Any]) -> list[ToolCall]:
     """Extract tool calls from an Anthropic or Converse/Nova content array."""
@@ -57,6 +84,21 @@ def _finish_tool(t: dict[str, Any]) -> ToolCall:
     return ToolCall(id=t.get("id", ""), name=t.get("name", ""), arguments=args)
 
 
+def bedrock_stream_flush(state: dict[str, Any]) -> list[StreamEvent]:
+    """Emit any tool call still buffered in ``state``.
+
+    Bedrock signals the end of a tool-use block with a ``contentBlockStop``
+    event, but over the raw event stream (the botocore ``EventStreamBuffer``
+    path) the Converse payload carries the block index without the enclosing
+    ``contentBlockStop`` key, so the stop is not always self-identifying. To
+    stay robust we also flush whenever a new tool block starts, at the finish
+    event, and — via this helper — when the stream ends.
+    """
+    if state.get("tool") is not None:
+        return [StreamEvent(type="tool_call", tool_call=_finish_tool(state.pop("tool")))]
+    return []
+
+
 def bedrock_stream_feed(body: dict[str, Any], state: dict[str, Any]) -> list[StreamEvent]:
     """Feed one Bedrock streaming event body; return canonical StreamEvents.
 
@@ -76,10 +118,13 @@ def bedrock_stream_feed(body: dict[str, Any], state: dict[str, Any]) -> list[Str
     # -- Tool-call block start --
     cb = body.get("content_block") or {}
     if btype == "content_block_start" and cb.get("type") == "tool_use":  # Anthropic
+        # Flush any prior tool block that never announced its own stop.
+        events.extend(bedrock_stream_flush(state))
         state["tool"] = {"id": cb.get("id", ""), "name": cb.get("name", ""), "args": ""}
         return events
     start = (body.get("contentBlockStart") or body).get("start") or {}
     if isinstance(start, dict) and "toolUse" in start:  # Converse / Nova
+        events.extend(bedrock_stream_flush(state))
         tu = start["toolUse"]
         state["tool"] = {"id": tu.get("toolUseId", ""), "name": tu.get("name", ""), "args": ""}
         return events
@@ -126,6 +171,9 @@ def bedrock_stream_feed(body: dict[str, Any], state: dict[str, Any]) -> list[Str
         or body.get("stopReason")
     )
     if stop_reason or btype in ("message_stop", "message_delta"):
+        # Flush any tool whose contentBlockStop was not self-identifying before
+        # signalling the end of the turn, so the call precedes the finish event.
+        events.extend(bedrock_stream_flush(state))
         events.append(
             StreamEvent(
                 type="finish",

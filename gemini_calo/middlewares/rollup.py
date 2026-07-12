@@ -48,6 +48,8 @@ async def rollup_middleware(
     request_type = GeminiProxyService.get_request_type(request)
     is_completion = request_type in [
         REQUEST_TYPE.OPENAI_COMPLETION,
+        REQUEST_TYPE.OPENAI_RESPONSES,
+        REQUEST_TYPE.ANTHROPIC_MESSAGES,
         REQUEST_TYPE.GEMINI_COMPLETION,
         REQUEST_TYPE.GEMINI_STREAMING_COMPLETION,
         REQUEST_TYPE.BEDROCK_INVOKE,
@@ -68,6 +70,10 @@ async def rollup_middleware(
     messages: list[dict] = []
     if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
         messages = _extract_openai_messages(json_body)
+    elif request_type == REQUEST_TYPE.OPENAI_RESPONSES:
+        messages = _extract_responses_messages(json_body)
+    elif request_type == REQUEST_TYPE.ANTHROPIC_MESSAGES:
+        messages = _extract_anthropic_messages(json_body)
     elif request_type in (
         REQUEST_TYPE.BEDROCK_INVOKE,
         REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
@@ -91,7 +97,6 @@ async def rollup_middleware(
             num_matched_messages = i
             break
 
-    original_request = request
     if found_key:
         logger.debug(
             f"Rollup cache hit: key={found_key}, "
@@ -108,6 +113,12 @@ async def rollup_middleware(
             json_body["messages"] = (
                 system_messages + user_messages[num_matched_messages:]
             )
+        elif request_type == REQUEST_TYPE.OPENAI_RESPONSES:
+            json_body = _inject_responses_system_prompt(_copy_json(json_body), context)
+            json_body["input"] = messages[num_matched_messages:]
+        elif request_type == REQUEST_TYPE.ANTHROPIC_MESSAGES:
+            json_body = _inject_anthropic_system_prompt(_copy_json(json_body), context)
+            json_body["messages"] = messages[num_matched_messages:]
         elif request_type in (
             REQUEST_TYPE.BEDROCK_INVOKE,
             REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
@@ -151,10 +162,26 @@ async def rollup_middleware(
         if not isinstance(response_json, dict):
             response_json = {}
 
-        assistant_message = {}
+        # The assistant turn can be more than one item (e.g. the OpenAI
+        # Responses "output" array carries a message plus function calls), so
+        # collect a list and append it verbatim — future requests replay these
+        # same items, which keeps the conversation hashes aligned.
+        assistant_items: list[dict] = []
         if request_type == REQUEST_TYPE.OPENAI_COMPLETION:
             choice = response_json.get("choices", [{}])[0]
             assistant_message = choice.get("message", {})
+            if assistant_message:
+                assistant_items = [assistant_message]
+        elif request_type == REQUEST_TYPE.OPENAI_RESPONSES:
+            output = response_json.get("output", [])
+            if isinstance(output, list):
+                assistant_items = [it for it in output if isinstance(it, dict)]
+        elif request_type == REQUEST_TYPE.ANTHROPIC_MESSAGES:
+            # Anthropic responses carry a top-level "content" block array; store
+            # it as an assistant message so it round-trips into future requests.
+            content_blocks = response_json.get("content")
+            if isinstance(content_blocks, list) and content_blocks:
+                assistant_items = [{"role": "assistant", "content": content_blocks}]
         elif request_type in (
             REQUEST_TYPE.BEDROCK_INVOKE,
             REQUEST_TYPE.BEDROCK_STREAMING_INVOKE,
@@ -167,19 +194,21 @@ async def rollup_middleware(
                 response_json.get("output", {}).get("message", {}).get("content", [])
             )
             if content_blocks:
-                text = " ".join(
+                text = "".join(
                     b.get("text", "")
                     for b in content_blocks
                     if isinstance(b, dict) and "text" in b
                 )
                 # Store in array format so it round-trips into future requests
-                assistant_message = {"role": "assistant", "content": [{"text": text}]}
+                assistant_items = [{"role": "assistant", "content": [{"text": text}]}]
         else:  # Gemini
             candidate = response_json.get("candidates", [{}])[0]
             assistant_message = candidate.get("content", {})
+            if assistant_message:
+                assistant_items = [assistant_message]
 
-        if assistant_message:
-            new_history = messages + [assistant_message]
+        if assistant_items:
+            new_history = messages + assistant_items
             new_key = _get_message_key(new_history)
 
             conversation_text = json.dumps(new_history)
@@ -224,6 +253,24 @@ def _extract_bedrock_messages(body: dict) -> list[dict]:
     return [m for m in messages if m.get("role") != "system"]
 
 
+def _extract_anthropic_messages(body: dict) -> list[dict]:
+    # Anthropic keeps the system prompt in a top-level "system" field, but be
+    # defensive against clients that put a system turn inside "messages".
+    messages = body.get("messages", [])
+    return [
+        m for m in messages if isinstance(m, dict) and m.get("role") != "system"
+    ]
+
+
+def _extract_responses_messages(body: dict) -> list[dict]:
+    # The Responses API takes "input" as either a bare string (a single-shot
+    # prompt with no prior turns to roll up) or an array of items.
+    input_data = body.get("input")
+    if not isinstance(input_data, list):
+        return []
+    return [item for item in input_data if isinstance(item, dict)]
+
+
 def _get_message_key(messages: list[dict]) -> str:
     if not messages:
         return ""
@@ -258,6 +305,27 @@ def _inject_bedrock_system_prompt(body: dict, context: str) -> dict:
             body["system"] = [{"text": context}]
         else:
             body["system"] = context
+    return body
+
+
+def _inject_anthropic_system_prompt(body: dict, context: str) -> dict:
+    existing = body.get("system")
+    if isinstance(existing, list):
+        # Block-array form: prepend a text block.
+        body["system"] = [{"type": "text", "text": context}] + existing
+    elif isinstance(existing, str) and existing:
+        body["system"] = f"{context}\n{existing}"
+    else:
+        body["system"] = context
+    return body
+
+
+def _inject_responses_system_prompt(body: dict, context: str) -> dict:
+    existing = body.get("instructions")
+    if isinstance(existing, str) and existing:
+        body["instructions"] = f"{context}\n{existing}"
+    else:
+        body["instructions"] = context
     return body
 
 

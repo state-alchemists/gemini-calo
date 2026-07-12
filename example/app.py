@@ -21,6 +21,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from gemini_calo.auth.aws import AWSCredentials, create_aws_sigv4_provider
+from gemini_calo.middlewares.rollup import create_rollup_middleware
 from gemini_calo.proxy import GeminiProxyService, RouteConfig
 
 
@@ -88,6 +89,9 @@ def create_app() -> FastAPI:
     )
 
     app = FastAPI(title="Gemini Calo Hub")
+    # Conversation roll-up / summarization (works across every client protocol,
+    # including /v1/messages and /v1/responses).
+    app.middleware("http")(create_rollup_middleware(proxy))
     app.include_router(proxy.gemini_router)
     app.include_router(proxy.openai_router)
     app.include_router(proxy.bedrock_router)
