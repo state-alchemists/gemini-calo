@@ -479,7 +479,12 @@ class GeminiProxyService:
             # is fully consumed, so close it in the iterator's finally block.
             async def _iter_and_close():
                 try:
-                    async for chunk in response.aiter_raw():
+                    # Use aiter_bytes (decoded) not aiter_raw (still gzip/deflate
+                    # compressed): strip_compression_headers() removes the
+                    # Content-Encoding header, so the body forwarded to the client
+                    # must be decompressed to match. Raw bytes here produce an
+                    # undecodable gzip stream on the client (empty/garbage output).
+                    async for chunk in response.aiter_bytes():
                         yield chunk
                 finally:
                     await response.aclose()

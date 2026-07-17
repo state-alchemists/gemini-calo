@@ -16,6 +16,9 @@
 #   ZRB_LLM_MODEL=nova              zrb llm chat --interactive false --message "hello"
 # -----------------------------------------------------------
 
+# ZRB_INIT_SCRIPTS="": ignore any ambient user init script (e.g. a personal
+# ~/zrb_init.py pulling in unrelated deps) so zrb starts clean against Calo.
+export ZRB_INIT_SCRIPTS=""
 export ZRB_LLM_BASE_URL="http://localhost:8000/v1"
 export ZRB_LLM_API_KEY="not-needed"
 export ZRB_LLM_MODEL="${ZRB_LLM_MODEL:-deepseek-chat}"

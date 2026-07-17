@@ -136,7 +136,9 @@ if have codex; then
 else skip "codex (all models)" "codex not installed"; fi
 
 if have zrb; then
-  export ZRB_LLM_BASE_URL="$BASE/v1" ZRB_LLM_API_KEY="not-needed"
+  # ZRB_INIT_SCRIPTS="": ignore any ambient user init script (e.g. a personal
+  # ~/zrb_init.py pulling in unrelated deps) so zrb starts clean against Calo.
+  export ZRB_LLM_BASE_URL="$BASE/v1" ZRB_LLM_API_KEY="not-needed" ZRB_INIT_SCRIPTS=""
   for M in "${MODELS[@]}"; do
     # zrb treats ":" in a model id as provider:model, so use the colon-free
     # "nova" alias for Bedrock ids (see app.py / zrb-env.sh).

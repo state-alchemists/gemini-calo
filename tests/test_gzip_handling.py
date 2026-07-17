@@ -221,8 +221,10 @@ def test_streaming_response_with_gzip(proxy_client, httpx_mock):
         b'{"candidates": [{"content": {"parts": [{"text": " World"}]}}]}\n',
     ]
 
-    # Mock a streaming response - create an async iterator
-    async def mock_aiter_raw():
+    # Mock a streaming response - create an async iterator. The proxy forwards
+    # aiter_bytes() (decoded) rather than aiter_raw() (still compressed) so the
+    # body matches the stripped Content-Encoding header.
+    async def mock_aiter_bytes():
         for chunk in stream_data:
             yield chunk
 
@@ -230,7 +232,7 @@ def test_streaming_response_with_gzip(proxy_client, httpx_mock):
     mock_response = AsyncMock()
     mock_response.status_code = 200
     mock_response.headers = {}  # No content-encoding header for test
-    mock_response.aiter_raw = mock_aiter_raw
+    mock_response.aiter_bytes = mock_aiter_bytes
     mock_response.__aenter__ = AsyncMock(return_value=mock_response)
     mock_response.__aexit__ = AsyncMock(return_value=None)
 
