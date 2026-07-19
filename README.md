@@ -603,14 +603,66 @@ zrb llm ask "What is the current weather at my current location?"
 
 See [`example/zrb-env.sh`](example/zrb-env.sh).
 
-### Other clients (codex, opencode)
+### opencode
 
-The [`example/`](example/) directory includes configs that never touch your global setup:
+Configured by a **file, no env vars**. Provide an `opencode.json` (in the cwd or
+`~/.config/opencode/opencode.json`) registering Calo as an OpenAI-compatible provider:
 
-| Client | Speaks | Setup | Run |
-|---|---|---|---|
-| codex | OpenAI Responses | `source example/codex-env.sh` (local `CODEX_HOME`, `wire_api = "responses"`) | `codex exec -m gemini-2.5-pro "…"` |
-| opencode | OpenAI-compatible | cwd [`example/opencode.json`](example/opencode.json) | `opencode run --model calo/<model> "…"` |
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "calo": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Gemini Calo",
+      "options": {
+        "baseURL": "http://localhost:8000/v1",
+        "apiKey": "my_secret_proxy_key_1"
+      },
+      "models": {
+        "gemini-2.5-pro": {},
+        "deepseek-chat": {},
+        "amazon.nova-pro-v1:0": {}
+      }
+    }
+  }
+}
+```
+
+```bash
+opencode run --model calo/gemini-2.5-pro "hi"
+```
+
+Ready-made: [`example/opencode.json`](example/opencode.json).
+
+### codex
+
+codex speaks the OpenAI **Responses API**. It needs **one config file** plus env
+pointing at it. Put a `config.toml` in a `CODEX_HOME` dir so your global
+`~/.codex` (config + ChatGPT login) is untouched:
+
+`$CODEX_HOME/config.toml`:
+
+```toml
+model = "gemini-2.5-pro"
+model_provider = "calo"
+
+[model_providers.calo]
+name = "Gemini Calo"
+base_url = "http://localhost:8000/v1"
+wire_api = "responses"
+env_key = "CALO_API_KEY"   # codex reads the proxy key from this env var
+```
+
+```bash
+export CODEX_HOME="$PWD/codex-home"        # dir holding the config.toml above
+export CALO_API_KEY="my_secret_proxy_key_1"
+codex exec "hi"
+codex exec -m deepseek-chat "hi"
+```
+
+Ready-made: [`example/codex-env.sh`](example/codex-env.sh) +
+[`example/codex-home/config.toml`](example/codex-home/config.toml).
 
 ### Native Gemini / Bedrock SDKs
 
