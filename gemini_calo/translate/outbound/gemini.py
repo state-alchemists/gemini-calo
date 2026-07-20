@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any, AsyncIterator
 
@@ -23,6 +24,16 @@ _GEMINI_TO_IR_FINISH = {
     "SAFETY": FINISH_CONTENT_FILTER,
     "RECITATION": FINISH_CONTENT_FILTER,
 }
+
+# Gemini 2.5 models attach a `thoughtSignature` (an opaque, encrypted reasoning
+# token) to every functionCall part. When that call is replayed in conversation
+# history the API *requires* the signature back, or it rejects the request with
+# "Function call is missing a thought in functionCall parts". The proxy is
+# stateless per request, and the inbound protocols (OpenAI/Anthropic) have no
+# field for a Gemini signature — so we smuggle it through the one value every
+# client round-trips verbatim: the tool-call id. Encode name+signature into the
+# id on the way out, decode it when replaying the call back to Gemini.
+_ID_PREFIX = "gcfc_"  # gemini-calo function call
 
 
 class GeminiOutbound:
@@ -145,6 +156,29 @@ class GeminiOutbound:
             yield StreamEvent(type="finish", finish_reason=FINISH_STOP)
 
 
+def _encode_call_id(name: str, thought_signature: str | None) -> str:
+    if not thought_signature:
+        # Nothing to carry — keep the plain name so pre-existing behaviour and
+        # externally-injected tool calls are unchanged.
+        return name
+    payload = json.dumps(
+        {"n": name, "s": thought_signature}, separators=(",", ":")
+    ).encode()
+    return _ID_PREFIX + base64.urlsafe_b64encode(payload).decode()
+
+
+def _decode_call_id(call_id: str) -> tuple[str, str | None]:
+    """Return ``(name, thought_signature)`` for a possibly-encoded id."""
+    if not call_id.startswith(_ID_PREFIX):
+        return call_id, None
+    try:
+        payload = base64.urlsafe_b64decode(call_id[len(_ID_PREFIX):])
+        obj = json.loads(payload)
+        return obj.get("n", call_id), obj.get("s")
+    except (ValueError, json.JSONDecodeError):
+        return call_id, None
+
+
 def _function_declaration(t: Any) -> dict[str, Any]:
     decl: dict[str, Any] = {"name": t.name, "description": t.description}
     # Gemini rejects an empty parameters object; only include when populated.
@@ -224,7 +258,13 @@ def _parts_from_message(m: Message) -> list[dict[str, Any]]:
         if p.type == "text" and p.text:
             parts.append({"text": p.text})
     for tc in m.tool_calls:
-        parts.append({"functionCall": {"name": tc.name, "args": tc.arguments}})
+        part: dict[str, Any] = {"functionCall": {"name": tc.name, "args": tc.arguments}}
+        _, thought_signature = _decode_call_id(tc.id)
+        if thought_signature:
+            # Gemini requires the signature it issued to be echoed back on the
+            # replayed functionCall part; without it the request is rejected.
+            part["thoughtSignature"] = thought_signature
+        parts.append(part)
     return parts
 
 
@@ -243,8 +283,13 @@ def _gemini_to_ir(data: dict[str, Any]) -> ChatResponse:
     for p in parts:
         fc = p.get("functionCall")
         if fc:
+            name = fc.get("name", "")
             resp.tool_calls.append(
-                ToolCall(id=fc.get("name", ""), name=fc.get("name", ""), arguments=fc.get("args", {}) or {})
+                ToolCall(
+                    id=_encode_call_id(name, p.get("thoughtSignature")),
+                    name=name,
+                    arguments=fc.get("args", {}) or {},
+                )
             )
     resp.finish_reason = (
         FINISH_TOOL_CALLS
@@ -266,12 +311,13 @@ def _gemini_chunk_to_events(data: dict[str, Any]) -> list[StreamEvent]:
             fc = part.get("functionCall")
             if fc:
                 # Gemini streams each functionCall whole.
+                name = fc.get("name", "")
                 events.append(
                     StreamEvent(
                         type="tool_call",
                         tool_call=ToolCall(
-                            id=fc.get("name", ""),
-                            name=fc.get("name", ""),
+                            id=_encode_call_id(name, part.get("thoughtSignature")),
+                            name=name,
                             arguments=fc.get("args", {}) or {},
                         ),
                     )

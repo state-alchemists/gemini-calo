@@ -200,7 +200,7 @@ def test_find_route_none_model_returns_none():
 
 
 def test_gemini_request_routed_to_custom_url(httpx_mock):
-    route = RouteConfig(url=ALT_BASE_URL, api_keys=["alt-key"], auth_type="bearer")
+    route = RouteConfig(url=ALT_BASE_URL, api_keys=["alt-key"], auth="bearer")
     proxy = _make_proxy_with_routes(**{"gemini-2.5-pro*": route})
     client = _make_test_client(proxy)
 
@@ -221,7 +221,7 @@ def test_gemini_request_routed_to_custom_url(httpx_mock):
 
 
 def test_openai_request_routed_to_custom_url(httpx_mock):
-    route = RouteConfig(url=ALT_BASE_URL, api_keys=["alt-key"], auth_type="bearer")
+    route = RouteConfig(url=ALT_BASE_URL, api_keys=["alt-key"], auth="bearer")
     proxy = _make_proxy_with_routes(**{"gpt-4*": route})
     client = _make_test_client(proxy)
 
@@ -271,7 +271,7 @@ def test_route_bearer_auth_sends_authorization_header(httpx_mock):
     route = RouteConfig(
         url=ALT_BASE_URL,
         api_keys=["secret-key"],
-        auth_type="bearer",
+        auth="bearer",
     )
     proxy = _make_proxy_with_routes(**{"gpt-4*": route})
     client = _make_test_client(proxy)
@@ -296,7 +296,7 @@ def test_route_goog_auth_sends_x_goog_api_key_header(httpx_mock):
     route = RouteConfig(
         url=ALT_BASE_URL,
         api_keys=["goog-key"],
-        auth_type="x-goog-api-key",
+        auth="x-goog-api-key",
     )
     proxy = _make_proxy_with_routes(**{"gemini-alt*": route})
     client = _make_test_client(proxy)
@@ -326,7 +326,7 @@ def test_route_round_robin_across_requests(httpx_mock):
     route = RouteConfig(
         url=ALT_BASE_URL,
         api_keys=["key-1", "key-2"],
-        auth_type="bearer",
+        auth="bearer",
     )
     proxy = _make_proxy_with_routes(**{"gpt-4*": route})
     client = _make_test_client(proxy)
